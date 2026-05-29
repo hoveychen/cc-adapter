@@ -180,6 +180,9 @@ func PostInternalEvent(eventName string, eventData map[string]any, accountUUID s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-service-name", "claude-code")
+	// Match the extension's axios client UA (VERSION 1.9.0) instead of leaking
+	// Go-http-client/1.1.
+	req.Header.Set("User-Agent", "axios/1.9.0")
 	// Note: no Authorization header — the account UUID rides in the body.
 
 	resp, err := httpClient.Do(req)

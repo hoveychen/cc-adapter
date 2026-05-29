@@ -131,6 +131,12 @@ func doGet(path string, extra map[string]string, timeout time.Duration) ([]byte,
 	for k, v := range extra {
 		req.Header.Set(k, v)
 	}
+	// Match the extension's axios client UA (axios sets "axios/"+VERSION via
+	// setHeaderIfUnset; VERSION is 1.9.0 in extension.js) so cc-adapter's own
+	// requests don't leak a Go-http-client/1.1 fingerprint.
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "axios/1.9.0")
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
