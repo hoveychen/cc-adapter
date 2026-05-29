@@ -86,10 +86,17 @@ func runPrint(host *streamjson.Host, opts cliOpts, ps *printState, turnDone <-ch
 	if err := feedPrompt(host, opts, logger); err != nil {
 		return err
 	}
-	// Signal end-of-input so the child finishes the turn and exits.
-	_ = host.CloseInput()
-
+	// Do NOT close claude's stdin yet. Because we always inject in-process MCP
+	// servers (ide + claude-vscode), claude initializes them with
+	// MCP_CONNECTION_NONBLOCKING by sending mcp_message control_requests over the
+	// control channel AFTER the user turn — and the answers travel back over
+	// claude's stdin. Closing stdin here (before the turn produces a result)
+	// severs that handshake: the mcp_response never lands, claude marks the
+	// servers failed, and ide_tools drops to 0. Wait for the result first,
+	// mirroring the relay path's firstResult discipline, then signal end-of-input
+	// so claude exits.
 	result := <-turnDone
+	_ = host.CloseInput()
 
 	switch ps.format {
 	case "stream-json":
