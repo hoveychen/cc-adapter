@@ -1,0 +1,13 @@
+# Compiled binary
+/cc-adapter
+*.exe
+
+# Go
+/vendor/
+
+# OS
+.DS_Store
+
+# Agent scratch (not version-controlled)
+/TASKS.md
+/.worktrees/
