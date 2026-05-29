@@ -220,6 +220,61 @@ type OutMCPMessageRequest struct {
 	Message    json.RawMessage `json:"message"`
 }
 
+// MergeSDKMcpServers takes an initialize control_request body (the inner
+// `request` object the Agent SDK sends downstream) and returns it with the
+// given in-process server names unioned into its `sdkMcpServers` array. This is
+// how cc-adapter, sitting as a relay between the SDK (parent) and the real
+// claude (child), injects its own IDE + claude-vscode in-process MCP servers
+// into the SDK's handshake: the SDK's declared servers are preserved, and the
+// adapter's are added, so the real claude exposes both sets as mcp__<name>__*
+// and tunnels each server's JSON-RPC over mcp_message frames.
+//
+// The merge is order-preserving (SDK's names first, then any new adapter names)
+// and idempotent — a name already present is not duplicated. Entries the SDK
+// declared as objects rather than bare strings are left untouched; only string
+// names are compared for the dedup. A nil/empty/!object body yields a fresh
+// object carrying just {"subtype":"initialize","sdkMcpServers":[names...]}.
+func MergeSDKMcpServers(body json.RawMessage, names ...string) json.RawMessage {
+	obj := map[string]json.RawMessage{}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &obj)
+	}
+	if obj == nil {
+		obj = map[string]json.RawMessage{}
+	}
+	if _, ok := obj["subtype"]; !ok {
+		obj["subtype"], _ = json.Marshal("initialize")
+	}
+
+	var existing []json.RawMessage
+	if raw, ok := obj["sdkMcpServers"]; ok {
+		_ = json.Unmarshal(raw, &existing)
+	}
+	// Collect the string names already present so we don't add duplicates.
+	have := map[string]bool{}
+	for _, e := range existing {
+		var s string
+		if json.Unmarshal(e, &s) == nil {
+			have[s] = true
+		}
+	}
+	for _, n := range names {
+		if have[n] {
+			continue
+		}
+		have[n] = true
+		nm, _ := json.Marshal(n)
+		existing = append(existing, nm)
+	}
+	if existing == nil {
+		existing = []json.RawMessage{}
+	}
+	obj["sdkMcpServers"], _ = json.Marshal(existing)
+
+	out, _ := json.Marshal(obj)
+	return out
+}
+
 // JSONRPCNotification is a JSON-RPC 2.0 notification (no id), e.g. the
 // log_event the host pushes to the claude-vscode comm server.
 type JSONRPCNotification struct {
