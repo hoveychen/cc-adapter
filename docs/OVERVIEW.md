@@ -30,6 +30,8 @@ claude --output-format stream-json --input-format stream-json --verbose --permis
 
 下游的 `-p` / `--output-format` / `--input-format` 只决定 adapter 怎么跟**调用方**说话：adapter 通过 host 的 RawSink 把子进程的 stream-json 帧重新呈现给下游——`text` 打最终 result 文本，`json` 透出 result 帧，`stream-json` 逐帧透出（过滤掉 control 通道帧，使之与真 `claude -p` 一致）。除 I/O 类与管理类 flag 外，其余 claude 会话 flag（`--model`、`--add-dir`、`--system-prompt`、`--permission-mode` 等）原样转发给子进程，无需逐个白名单。
 
+**SDK-driven relay 模式**：当下游 in/out 都是 `stream-json`（即官方 Claude Agent SDK 的双向控制协议传输）时，adapter 不再做上面这套单向 `claude -p` 呈现，而是进入 `relay.go` 的**双向 control 中继**：在 SDK（父）与真 claude（子）之间忠实转发每一帧，并把 SDK 的 `initialize` 与 cc-adapter 的 `ide`+`claude-vscode` 进程内 server 合并、按 server_name 路由 `mcp_message`、注入 `claude_launched`，从而让 SDK 能把 cc-adapter 当 claude 驱动，上游仍是完整 vscode 会话。两个协议细节：`-v`/`--version` 透传给真 claude（SDK 版本预检），claude 的 stdin 保持到 `result` 帧才关（control 协议要求全程开）。详见 README「用官方 Claude Agent SDK 驱动」。
+
 ## 流量指纹对照（cc-adapter vs 真插件）
 
 | 请求 | 真插件触发 | cc-adapter 复刻 | 验证 |
