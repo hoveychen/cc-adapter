@@ -35,7 +35,14 @@ import (
 	"github.com/hoveychen/cc-adapter/internal/streamjson"
 )
 
+// main delegates to run so that deferred cleanup (lockfile removal, server
+// shutdown) actually executes — os.Exit, which we need for the child's exit
+// code, skips deferred functions.
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		model      = flag.String("model", "", "pass --model to claude")
 		noIDE      = flag.Bool("no-ide", false, "do not start the IDE side-channel server (billing attribution still applies)")
@@ -49,7 +56,8 @@ func main() {
 
 	claudePath, err := resolveClaude(*claudeBin)
 	if err != nil {
-		logger.Fatalf("%v", err)
+		logger.Printf("%v", err)
+		return 1
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -67,7 +75,8 @@ func main() {
 		provider := ide.NewHeadlessProvider(workspaceFolders)
 		srv, err := ide.NewServer(provider, logger)
 		if err != nil {
-			logger.Fatalf("ide server: %v", err)
+			logger.Printf("ide server: %v", err)
+			return 1
 		}
 		srv.Start()
 		defer srv.Stop()
@@ -81,7 +90,8 @@ func main() {
 		}
 		lockPath, err := ide.WriteLock(srv.Port(), lock)
 		if err != nil {
-			logger.Fatalf("lockfile: %v", err)
+			logger.Printf("lockfile: %v", err)
+			return 1
 		}
 		defer func() { _ = ide.RemoveLock(srv.Port()) }()
 		logger.Printf("IDE side-channel on 127.0.0.1:%d, lock %s", srv.Port(), lockPath)
@@ -108,7 +118,8 @@ func main() {
 		Logger:     logger,
 	})
 	if err := host.Start(ctx); err != nil {
-		logger.Fatalf("%v", err)
+		logger.Printf("%v", err)
+		return 1
 	}
 
 	// Drain events: print assistant text to stdout, everything else to stderr.
@@ -144,14 +155,15 @@ func main() {
 
 	if prompt != "" {
 		if err := host.SendUserText(prompt); err != nil {
-			logger.Fatalf("send: %v", err)
+			logger.Printf("send: %v", err)
+			return 1
 		}
 		<-turnDone
 		_ = host.CloseInput()
 	} else {
 		runREPL(host, turnDone, logger)
 	}
-	os.Exit(host.Wait())
+	return host.Wait()
 }
 
 // runREPL reads one user turn per stdin line until EOF or /exit.
