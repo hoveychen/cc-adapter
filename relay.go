@@ -81,6 +81,17 @@ type relay struct {
 	outMu sync.Mutex
 
 	launched sync.Once
+
+	// firstResult is closed when claude emits its first result frame (or when the
+	// upstream read loop ends, as a safety net). Because cc-adapter always injects
+	// in-process MCP servers (ide + claude-vscode), the control protocol needs
+	// claude's stdin to stay open for the whole turn so the relay can answer
+	// claude's mcp_message / can_use_tool round-trips and inject claude_launched —
+	// so the relay must not close claude's stdin when the SDK closes its own until
+	// the turn has produced a result. This mirrors the SDK's own
+	// wait_for_result_and_end_input discipline.
+	firstResult chan struct{}
+	frOnce      sync.Once
 }
 
 // newRelay builds a relay over an already-configured Host. The Host must be
@@ -96,17 +107,36 @@ func newRelay(host *streamjson.Host, denyWrites bool, logger *log.Logger) *relay
 		denyWrites:   denyWrites,
 		localServers: local,
 		out:          os.Stdout,
+		firstResult:  make(chan struct{}),
 	}
 }
+
+// signalFirstResult unblocks run()'s gate on the claude stdin close. Idempotent.
+func (r *relay) signalFirstResult() { r.frOnce.Do(func() { close(r.firstResult) }) }
 
 // run pumps the downstream SDK stdin into the upstream claude until EOF, then
 // signals end-of-input and waits for claude to exit, returning its exit code.
 // The upstream→downstream direction is driven by the Host read goroutine calling
 // onUpstreamLine (wired as RawSink), so it runs concurrently with this pump.
 func (r *relay) run(_ context.Context, stdin io.Reader) int {
+	// Safety net: if the upstream read loop ends (claude exits) before a result
+	// frame, unblock the stdin-close gate so run() can't hang. The Host closes
+	// Events when claude's stdout reaches EOF; in relay mode nothing is pushed
+	// onto Events, so this drain just waits for that close.
+	go func() {
+		for range r.host.Events {
+		}
+		r.signalFirstResult()
+	}()
+
 	if err := r.pumpDownstream(stdin); err != nil {
 		r.logger.Printf("relay: downstream read: %v", err)
 	}
+	// The SDK has closed its downstream stdin. Do NOT close claude's stdin yet:
+	// because we always inject in-process MCP servers, the control protocol needs
+	// it open until the turn produces a result (so claude's mcp_message init and
+	// any can_use_tool round-trips can be answered, and claude_launched lands).
+	<-r.firstResult
 	_ = r.host.CloseInput()
 	return r.host.Wait()
 }
@@ -197,10 +227,13 @@ func (r *relay) onUpstreamLine(line []byte) {
 		r.handleUpstreamControlRequest(line)
 	default:
 		// Data frame: forward verbatim. system:init triggers the one-shot
-		// claude_launched log_event, mirroring the extension.
+		// claude_launched log_event; a result frame releases the stdin-close gate.
 		r.writeDownstream(line)
-		if t.Type == streamjson.TypeSystem {
+		switch t.Type {
+		case streamjson.TypeSystem:
 			r.maybeLaunched(line)
+		case streamjson.TypeResult:
+			r.signalFirstResult()
 		}
 	}
 }
@@ -246,17 +279,23 @@ func (r *relay) handleUpstreamControlRequest(line []byte) {
 }
 
 // maybeLaunched fires claude_launched exactly once, on the first system:init.
+// It is sent synchronously on the upstream read goroutine — not deferred to a
+// separate goroutine — so the single small frame reaches claude's stdin while
+// it is still open. (A goroutine raced CloseInput on short one-shot queries and
+// lost: the session ended and stdin closed before the deferred write ran,
+// dropping the fingerprint event.) system:init arrives right after the
+// handshake, long before the turn completes, so stdin is reliably open here.
 func (r *relay) maybeLaunched(line []byte) {
 	var m streamjson.SystemMessage
 	if json.Unmarshal(line, &m) != nil || m.Subtype != "init" {
 		return
 	}
 	r.launched.Do(func() {
-		go func() {
-			if err := r.host.SendLogEventAsync("claude_launched", map[string]any{"ide": "vscode", "isFullEditor": true}); err != nil {
-				r.logger.Printf("relay: log_event claude_launched: %v", err)
-			}
-		}()
+		if err := r.host.SendLogEventAsync("claude_launched", map[string]any{"ide": "vscode", "isFullEditor": true}); err != nil {
+			r.logger.Printf("relay: log_event claude_launched: %v", err)
+		} else {
+			r.logger.Printf("relay: sent log_event claude_launched")
+		}
 	})
 }
 
