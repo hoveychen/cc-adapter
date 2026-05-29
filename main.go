@@ -1,9 +1,11 @@
 // Command cc-adapter drives the real `claude` binary exactly the way the VS Code
-// "Claude Code" extension does: it spins up the IDE WebSocket side-channel
-// (lockfile + MCP server), then spawns claude as a bidirectional stream-json
-// child tagged CLAUDE_CODE_ENTRYPOINT=claude-vscode — so from Anthropic's
-// backend the traffic is attributed to claude_code_vscode and the IDE
-// auto-connect path is exercised, identical to a real VS Code session.
+// "Claude Code" extension does in its default (webview) mode: it registers the
+// IDE tools as an in-process SDK MCP server and spawns claude as a bidirectional
+// stream-json child tagged CLAUDE_CODE_ENTRYPOINT=claude-vscode — so from
+// Anthropic's backend the traffic is attributed to claude_code_vscode and the
+// IDE tools (mcp__ide__*) are reachable, identical to a real VS Code session.
+// The IDE JSON-RPC is tunneled over the stream-json control channel's
+// mcp_message frames (not the terminal-mode WebSocket + lockfile + SSE_PORT).
 //
 // Unlike a transparent passthrough wrapper (which inherits whatever mode the
 // user invokes), cc-adapter IS the stream-json host: it owns stdin/stdout,
@@ -35,9 +37,8 @@ import (
 	"github.com/hoveychen/cc-adapter/internal/streamjson"
 )
 
-// main delegates to run so that deferred cleanup (lockfile removal, server
-// shutdown) actually executes — os.Exit, which we need for the child's exit
-// code, skips deferred functions.
+// main delegates to run so that deferred cleanup actually executes — os.Exit,
+// which we need for the child's exit code, skips deferred functions.
 func main() {
 	os.Exit(run())
 }
@@ -45,7 +46,7 @@ func main() {
 func run() int {
 	var (
 		model      = flag.String("model", "", "pass --model to claude")
-		noIDE      = flag.Bool("no-ide", false, "do not start the IDE side-channel server (billing attribution still applies)")
+		noIDE      = flag.Bool("no-ide", false, "do not register the IDE in-process MCP server (billing attribution still applies)")
 		denyWrites = flag.Bool("deny-writes", false, "deny write-class tools (Write/Edit/MultiEdit/NotebookEdit/Bash)")
 		claudeBin  = flag.String("claude-bin", "", "path to the real claude binary (else $CLAUDE_REAL_BIN, else PATH)")
 	)
@@ -69,33 +70,14 @@ func run() int {
 		workspaceFolders = []string{cwd}
 	}
 
-	// Bring up the IDE side-channel so claude dials back in (the VS Code path).
-	var port int
+	// Register the IDE tools as an in-process MCP server. claude reaches them by
+	// tunneling JSON-RPC over the stream-json control channel's mcp_message
+	// frames (the default-webview-mode path).
+	var mcpServer *ide.MCPServer
 	if !*noIDE {
 		provider := ide.NewHeadlessProvider(workspaceFolders)
-		srv, err := ide.NewServer(provider, logger)
-		if err != nil {
-			logger.Printf("ide server: %v", err)
-			return 1
-		}
-		srv.Start()
-		defer srv.Stop()
-
-		lock := ide.LockInfo{
-			PID:              os.Getpid(),
-			WorkspaceFolders: workspaceFolders,
-			IDEName:          "Visual Studio Code",
-			Transport:        "ws",
-			AuthToken:        srv.AuthToken(),
-		}
-		lockPath, err := ide.WriteLock(srv.Port(), lock)
-		if err != nil {
-			logger.Printf("lockfile: %v", err)
-			return 1
-		}
-		defer func() { _ = ide.RemoveLock(srv.Port()) }()
-		logger.Printf("IDE side-channel on 127.0.0.1:%d, lock %s", srv.Port(), lockPath)
-		port = srv.Port()
+		mcpServer = ide.NewMCPServer(provider, logger)
+		logger.Printf("IDE in-process MCP server enabled (server name: ide)")
 	}
 
 	var extra []string
@@ -111,11 +93,12 @@ func run() int {
 	}
 
 	host := streamjson.NewHost(streamjson.Config{
-		ClaudePath: claudePath,
-		Port:       port,
-		ExtraArgs:  extra,
-		Permission: perm,
-		Logger:     logger,
+		ClaudePath:    claudePath,
+		MCPServer:     mcpServer,
+		IDEServerName: "ide",
+		ExtraArgs:     extra,
+		Permission:    perm,
+		Logger:        logger,
 	})
 	if err := host.Start(ctx); err != nil {
 		logger.Printf("%v", err)
@@ -129,7 +112,14 @@ func run() int {
 		for ev := range host.Events {
 			switch ev.Kind {
 			case streamjson.EventSystemInit:
-				logger.Printf("session=%s model=%s (entrypoint=claude-vscode)", ev.System.SessionID, ev.System.Model)
+				ideTools := 0
+				for _, t := range ev.System.Tools {
+					if strings.HasPrefix(t, "mcp__ide__") {
+						ideTools++
+					}
+				}
+				logger.Printf("session=%s model=%s mcp_servers=%v ide_tools=%d (entrypoint=claude-vscode)",
+					ev.System.SessionID, ev.System.Model, ev.System.MCPServers, ideTools)
 			case streamjson.EventAssistantText:
 				fmt.Println(ev.Text)
 			case streamjson.EventToolUse:

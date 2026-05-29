@@ -9,10 +9,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hoveychen/cc-adapter/internal/ide"
 )
 
 // PermissionFunc decides a can_use_tool request. Returning allow=false denies
@@ -44,11 +45,12 @@ type Event struct {
 // Host drives a real claude binary as a stream-json child, impersonating the
 // VS Code extension's SDK transport.
 type Host struct {
-	claudePath string
-	port       int      // IDE WebSocket port advertised via CLAUDE_CODE_SSE_PORT (0 = none)
-	extraArgs  []string // passthrough flags (e.g. --model, --add-dir)
-	permission PermissionFunc
-	logger     *log.Logger
+	claudePath    string
+	mcpServer     *ide.MCPServer // in-process IDE MCP server (nil = no IDE tools)
+	ideServerName string         // sdkMcpServers key the IDE tools are exposed under
+	extraArgs     []string       // passthrough flags (e.g. --model, --add-dir)
+	permission    PermissionFunc
+	logger        *log.Logger
 
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
@@ -66,11 +68,12 @@ type Host struct {
 
 // Config configures a Host.
 type Config struct {
-	ClaudePath string
-	Port       int
-	ExtraArgs  []string
-	Permission PermissionFunc
-	Logger     *log.Logger
+	ClaudePath    string
+	MCPServer     *ide.MCPServer
+	IDEServerName string
+	ExtraArgs     []string
+	Permission    PermissionFunc
+	Logger        *log.Logger
 }
 
 // NewHost prepares (but does not start) a Host.
@@ -84,14 +87,19 @@ func NewHost(cfg Config) *Host {
 		// Default: allow everything (headless automation has no human to prompt).
 		perm = func(string, json.RawMessage) (bool, string) { return true, "" }
 	}
+	ideName := cfg.IDEServerName
+	if ideName == "" {
+		ideName = "ide"
+	}
 	return &Host{
-		claudePath: cfg.ClaudePath,
-		port:       cfg.Port,
-		extraArgs:  cfg.ExtraArgs,
-		permission: perm,
-		logger:     logger,
-		pending:    make(map[string]chan ControlResponseBody),
-		Events:     make(chan Event, 64),
+		claudePath:    cfg.ClaudePath,
+		mcpServer:     cfg.MCPServer,
+		ideServerName: ideName,
+		extraArgs:     cfg.ExtraArgs,
+		permission:    perm,
+		logger:        logger,
+		pending:       make(map[string]chan ControlResponseBody),
+		Events:        make(chan Event, 64),
 	}
 }
 
@@ -109,18 +117,16 @@ func (h *Host) baselineArgs() []string {
 
 // buildEnv mirrors the extension's FV() + SDK env construction: tag the
 // entrypoint as claude-vscode (this is the billing-attribution signal that
-// makes traffic count as claude_code_vscode), point the IDE side-channel at our
-// server via CLAUDE_CODE_SSE_PORT, opt into auto-connect, and drop NODE_OPTIONS.
+// makes traffic count as claude_code_vscode) and drop NODE_OPTIONS. The IDE
+// tools are reached as an in-process sdkMcpServer over the control channel, so
+// no CLAUDE_CODE_SSE_PORT / auto-connect env is needed (that was the
+// terminal-mode WebSocket mechanism).
 func (h *Host) buildEnv() []string {
 	overrides := map[string]string{
 		"CLAUDE_CODE_ENTRYPOINT":     "claude-vscode",
 		"MCP_CONNECTION_NONBLOCKING": "true",
 		"CLAUDE_CODE_ENABLE_TASKS":   "0",
 		"CLAUDE_AGENT_SDK_VERSION":   "0.3.156",
-	}
-	if h.port > 0 {
-		overrides["CLAUDE_CODE_SSE_PORT"] = strconv.Itoa(h.port)
-		overrides["CLAUDE_CODE_AUTO_CONNECT_IDE"] = "true"
 	}
 	var env []string
 	seen := make(map[string]bool)
@@ -176,7 +182,7 @@ func (h *Host) Start(ctx context.Context) error {
 
 // Initialize sends the initialize control_request and waits for its receipt.
 func (h *Host) Initialize() error {
-	resp, err := h.sendControlRequest(InitializeRequest{Subtype: "initialize", SDKMcpServers: []string{}})
+	resp, err := h.sendControlRequest(InitializeRequest{Subtype: "initialize", SDKMcpServers: []string{h.ideServerName}})
 	if err != nil {
 		return err
 	}
@@ -374,14 +380,27 @@ func (h *Host) handleControlRequest(in InControlRequest) {
 			})
 		}
 		h.replyControlSuccess(in.RequestID, payload)
+	case CtlMCPMessage:
+		if h.mcpServer == nil || in.Request.ServerName != h.ideServerName {
+			h.replyControlError(in.RequestID, "unknown mcp server: "+in.Request.ServerName)
+			return
+		}
+		jsonrpcResp := h.mcpServer.Handle(in.Request.Message)
+		var payload json.RawMessage
+		if jsonrpcResp != nil {
+			payload, _ = json.Marshal(map[string]json.RawMessage{"mcp_response": jsonrpcResp})
+		} else {
+			payload = json.RawMessage(`{"mcp_response":{"jsonrpc":"2.0","result":{},"id":0}}`)
+		}
+		h.replyControlSuccess(in.RequestID, payload)
 	case CtlOAuthTokenRefresh:
 		// We don't manage refresh; auth comes from the shared config dir.
 		h.replyControlSuccess(in.RequestID, json.RawMessage(`{"accessToken":null}`))
 	case CtlHostAuthTokenRefresh:
 		h.replyControlSuccess(in.RequestID, json.RawMessage(`{"authToken":null}`))
 	default:
-		// hook_callback / mcp_message / elicitation: we registered none, so
-		// these shouldn't arrive. Report an error rather than hang the CLI.
+		// hook_callback / elicitation: we registered none, so these shouldn't
+		// arrive. Report an error rather than hang the CLI.
 		h.replyControlError(in.RequestID, "unsupported control request subtype: "+in.Request.Subtype)
 	}
 }

@@ -1,148 +1,55 @@
 package ide
 
 import (
-	"context"
 	"encoding/json"
 	"log"
-	"net"
-	"net/http"
 	"os"
-	"sync"
-
-	"github.com/gorilla/websocket"
 )
 
 const (
-	serverName    = "claude-vscode"
+	serverName    = "Claude Code VSCode MCP"
 	serverVersion = "2.1.156"
-	authHeader    = "x-claude-code-ide-authorization"
 )
 
-// Server impersonates the VS Code extension's MCP-over-WebSocket endpoint.
-type Server struct {
-	ln        net.Listener
-	port      int
-	authToken string
-	provider  StateProvider
-	logger    *log.Logger
-
-	upgrader websocket.Upgrader
-	httpSrv  *http.Server
-
-	mu      sync.Mutex
-	conn    *websocket.Conn // single active client (newest wins)
-	writeMu sync.Mutex
+// MCPServer is an in-process MCP server exposing the 12 IDE tools, driven by
+// the host over the stream-json control channel's mcp_message frames (the
+// default-webview-mode mechanism; not the terminal-mode WebSocket+lockfile).
+type MCPServer struct {
+	provider StateProvider
+	logger   *log.Logger
 }
 
-// NewServer binds a random localhost port and prepares (but does not start)
-// the MCP server. Call Start to accept connections.
-func NewServer(provider StateProvider, logger *log.Logger) (*Server, error) {
-	ln, port, err := FindFreePort()
-	if err != nil {
-		return nil, err
-	}
-	token, err := NewAuthToken()
-	if err != nil {
-		ln.Close()
-		return nil, err
-	}
+func NewMCPServer(provider StateProvider, logger *log.Logger) *MCPServer {
 	if logger == nil {
 		logger = log.New(os.Stderr, "[ide] ", log.LstdFlags)
 	}
-	return &Server{
-		ln:        ln,
-		port:      port,
-		authToken: token,
-		provider:  provider,
-		logger:    logger,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(*http.Request) bool { return true },
-		},
-	}, nil
+	return &MCPServer{provider: provider, logger: logger}
 }
 
-func (s *Server) Port() int         { return s.port }
-func (s *Server) AuthToken() string { return s.authToken }
-
-// Start begins serving on the already-bound listener.
-func (s *Server) Start() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleWS)
-	s.httpSrv = &http.Server{Handler: mux}
-	go func() {
-		if err := s.httpSrv.Serve(s.ln); err != nil && err != http.ErrServerClosed {
-			s.logger.Printf("server error: %v", err)
-		}
-	}()
-	s.logger.Printf("MCP server running on port %d (localhost only)", s.port)
+// Handle processes one inbound JSON-RPC message and returns the JSON-RPC
+// response to tunnel back, or nil for notifications (no id).
+func (s *MCPServer) Handle(raw json.RawMessage) json.RawMessage {
+	var msg Message
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		s.logger.Printf("bad mcp jsonrpc: %v", err)
+		return nil
+	}
+	if msg.Method == "" || len(msg.ID) == 0 {
+		return nil
+	}
+	result, rpcErr := s.dispatch(&msg)
+	resp := Message{JSONRPC: "2.0", ID: msg.ID}
+	if rpcErr != nil {
+		resp.Error = rpcErr
+	} else {
+		b, _ := json.Marshal(result)
+		resp.Result = b
+	}
+	out, _ := json.Marshal(resp)
+	return out
 }
 
-// Stop shuts down the HTTP server.
-func (s *Server) Stop() {
-	if s.httpSrv != nil {
-		_ = s.httpSrv.Shutdown(context.Background())
-	}
-}
-
-func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	// Auth handshake: the real claude binary sends the lockfile's authToken in
-	// the x-claude-code-ide-authorization header. Mismatch => close 1008.
-	if r.Header.Get(authHeader) != s.authToken {
-		s.logger.Printf("unauthorized WebSocket connection attempt")
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		s.logger.Printf("upgrade failed: %v", err)
-		return
-	}
-
-	// Single-client model: newest connection wins, like the extension.
-	s.mu.Lock()
-	if s.conn != nil {
-		_ = s.conn.Close()
-	}
-	s.conn = conn
-	s.mu.Unlock()
-	s.logger.Printf("new WS connection from %s", r.RemoteAddr)
-
-	defer func() {
-		s.mu.Lock()
-		if s.conn == conn {
-			s.conn = nil
-		}
-		s.mu.Unlock()
-		_ = conn.Close()
-	}()
-
-	for {
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			s.logger.Printf("ws read closed: %v", err)
-			return
-		}
-		var msg Message
-		if err := json.Unmarshal(data, &msg); err != nil {
-			s.logger.Printf("bad json: %v", err)
-			continue
-		}
-		s.handleMessage(conn, &msg)
-	}
-}
-
-func (s *Server) handleMessage(conn *websocket.Conn, msg *Message) {
-	switch {
-	case msg.IsRequest():
-		result, rpcErr := s.dispatch(msg)
-		s.reply(conn, msg.ID, result, rpcErr)
-	case msg.IsNotification():
-		// e.g. notifications/initialized — nothing to do.
-		s.logger.Printf("notification: %s", msg.Method)
-	}
-}
-
-func (s *Server) dispatch(msg *Message) (any, *RPCError) {
+func (s *MCPServer) dispatch(msg *Message) (any, *RPCError) {
 	switch msg.Method {
 	case "initialize":
 		var p InitializeParams
@@ -152,7 +59,7 @@ func (s *Server) dispatch(msg *Message) (any, *RPCError) {
 			ver = "2025-06-18"
 		}
 		return InitializeResult{
-			ProtocolVersion: ver, // echo the client's negotiated version
+			ProtocolVersion: ver,
 			Capabilities:    map[string]any{"tools": map[string]any{}},
 			ServerInfo:      ServerInfo{Name: serverName, Version: serverVersion},
 		}, nil
@@ -167,7 +74,7 @@ func (s *Server) dispatch(msg *Message) (any, *RPCError) {
 	}
 }
 
-func (s *Server) callTool(params json.RawMessage) (any, *RPCError) {
+func (s *MCPServer) callTool(params json.RawMessage) (any, *RPCError) {
 	var p ToolCallParams
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, &RPCError{Code: -32602, Message: "invalid params"}
@@ -179,7 +86,7 @@ func (s *Server) callTool(params json.RawMessage) (any, *RPCError) {
 	return res, nil
 }
 
-func (s *Server) invoke(name string, args json.RawMessage) (ToolCallResult, error) {
+func (s *MCPServer) invoke(name string, args json.RawMessage) (ToolCallResult, error) {
 	get := func(key string) string {
 		var m map[string]json.RawMessage
 		_ = json.Unmarshal(args, &m)
@@ -217,46 +124,4 @@ func (s *Server) invoke(name string, args json.RawMessage) (ToolCallResult, erro
 	default:
 		return ToolCallResult{IsError: true, Content: []ContentItem{{Type: "text", Text: "unknown tool: " + name}}}, nil
 	}
-}
-
-func (s *Server) reply(conn *websocket.Conn, id json.RawMessage, result any, rpcErr *RPCError) {
-	resp := Message{JSONRPC: "2.0", ID: id}
-	if rpcErr != nil {
-		resp.Error = rpcErr
-	} else {
-		b, _ := json.Marshal(result)
-		resp.Result = b
-	}
-	s.send(conn, resp)
-}
-
-func (s *Server) send(conn *websocket.Conn, msg Message) {
-	b, err := json.Marshal(msg)
-	if err != nil {
-		s.logger.Printf("marshal: %v", err)
-		return
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
-		s.logger.Printf("ws write: %v", err)
-	}
-}
-
-// Notify pushes a server->client JSON-RPC notification to the active client.
-// These are the IDE-side push events: selection_changed, diagnostics_changed,
-// at_mentioned, ide_connected.
-func (s *Server) Notify(method string, params any) {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
-	if conn == nil {
-		return
-	}
-	var raw json.RawMessage
-	if params != nil {
-		b, _ := json.Marshal(params)
-		raw = b
-	}
-	s.send(conn, Message{JSONRPC: "2.0", Method: method, Params: raw})
 }

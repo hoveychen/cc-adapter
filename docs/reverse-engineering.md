@@ -101,9 +101,18 @@ function FV(z){
 
 ---
 
-## 3. IDE 侧信道协议
+## 3. IDE 集成协议
 
-协议是 **本地 WebSocket + MCP**（env 名叫 SSE_PORT 但 `transport:"ws"`）。**扩展是 server，CLI 是 client。**
+IDE 工具有**两套**到达机制，对应扩展的两种运行模式：
+
+- **默认（webview）模式 —— control 通道 in-process MCP（cc-adapter 采用）。** IDE 那 12 个工具被注册为**进程内 SDK MCP server**：`initialize` 握手里声明 `sdkMcpServers:["ide"]`，CLI 据此把它们暴露为 `mcp__ide__*`，调用时不经任何 socket，而是把 JSON-RPC 包进 stream-json **control 通道的 `mcp_message` 帧**隧道往返。形状：
+  - 入站（CLI→host）：`{"type":"control_request","request_id":"<id>","request":{"subtype":"mcp_message","server_name":"ide","message":<jsonrpc request>}}`
+  - host 把 `message`（含 method+id 的 JSON-RPC 请求）交给 in-process MCP server 处理，得到 JSON-RPC response
+  - 回执（host→CLI）：`{"type":"control_response","response":{"subtype":"success","request_id":"<id>","response":{"mcp_response":<jsonrpc response>}}}` —— 关键：响应包在 `response.mcp_response` 字段里
+  - 通知（无 id）：回 `{"mcp_response":{"jsonrpc":"2.0","result":{},"id":0}}`
+- **终端模式 / 外部 CLI 回连 —— 本地 WebSocket + lockfile + SSE_PORT（cc-adapter 不用）。** 下面 3.1–3.4 描述的就是这条路：env 名叫 SSE_PORT 但 `transport:"ws"`，**扩展是 server，外部 CLI 是 client**。它适用于用户在集成终端里跑独立 `claude` 时让其回连扩展，**不是** webview 模式下扩展自己 spawn 的 SDK 子进程的工具到达方式。
+
+### 3.0 终端模式 WebSocket 侧信道（仅供对照）
 
 ### 3.1 lockfile + 端口发现
 

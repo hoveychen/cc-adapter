@@ -2,8 +2,9 @@ package ide
 
 import "encoding/json"
 
-// JSON-RPC 2.0 + minimal MCP framing, matching what the real claude binary
-// speaks to the VS Code extension over the WebSocket.
+// JSON-RPC 2.0 + minimal MCP framing for the in-process IDE MCP server. These
+// messages are tunneled over the stream-json control channel's mcp_message
+// frames (the default-webview-mode mechanism).
 
 type Message struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -19,12 +20,6 @@ type RPCError struct {
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
 }
-
-// IsRequest reports whether the message carries an id (i.e. expects a response).
-func (m *Message) IsRequest() bool { return len(m.ID) > 0 && m.Method != "" }
-
-// IsNotification reports a method call with no id.
-func (m *Message) IsNotification() bool { return len(m.ID) == 0 && m.Method != "" }
 
 // --- MCP initialize ---
 
