@@ -52,6 +52,7 @@ type Host struct {
 	commServerName string          // sdkMcpServers key the comm server is exposed under
 	extraArgs      []string        // passthrough flags (e.g. --model, --add-dir)
 	permission     PermissionFunc
+	rawSink        func([]byte) // optional: receives every raw stdout line (incl. trailing newline)
 	logger         *log.Logger
 
 	cmd     *exec.Cmd
@@ -76,6 +77,12 @@ type Config struct {
 	ExtraArgs     []string
 	Permission    PermissionFunc
 	Logger        *log.Logger
+
+	// RawSink, if set, is called with every raw line the child emits on stdout
+	// (the verbatim stream-json frame, including its trailing newline) before the
+	// line is decoded into an Event. Used by the print path to forward or capture
+	// frames at full fidelity (e.g. --output-format stream-json / json).
+	RawSink func([]byte)
 }
 
 // NewHost prepares (but does not start) a Host.
@@ -102,6 +109,7 @@ func NewHost(cfg Config) *Host {
 		commServerName: commName,
 		extraArgs:      cfg.ExtraArgs,
 		permission:     perm,
+		rawSink:        cfg.RawSink,
 		logger:         logger,
 		pending:        make(map[string]chan ControlResponseBody),
 		Events:         make(chan Event, 64),
@@ -323,6 +331,9 @@ func (h *Host) readLoop() {
 	for {
 		line, err := r.ReadBytes('\n')
 		if len(strings.TrimSpace(string(line))) > 0 {
+			if h.rawSink != nil {
+				h.rawSink(line)
+			}
 			h.handleLine(line)
 		}
 		if err != nil {
