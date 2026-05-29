@@ -208,6 +208,33 @@ type InitializeRequest struct {
 	SDKMcpServers []string `json:"sdkMcpServers"`
 }
 
+// OutMCPMessageRequest is the body of an mcp_message control_request we
+// initiate (host -> child): it tunnels a JSON-RPC message down to one of the
+// sdkMcpServers. The extension uses this to push log_event notifications to the
+// claude-vscode comm server. It becomes OutControlRequest.Request, so the full
+// wire frame is {type:control_request, request_id, request:{subtype:mcp_message,
+// server_name, message:{...}}}.
+type OutMCPMessageRequest struct {
+	Subtype    string          `json:"subtype"` // "mcp_message"
+	ServerName string          `json:"server_name"`
+	Message    json.RawMessage `json:"message"`
+}
+
+// JSONRPCNotification is a JSON-RPC 2.0 notification (no id), e.g. the
+// log_event the host pushes to the claude-vscode comm server.
+type JSONRPCNotification struct {
+	JSONRPC string `json:"jsonrpc"` // "2.0"
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
+}
+
+// LogEventParams is the params of a log_event notification. eventData mirrors
+// the extension's per-event payload (e.g. {ide:"vscode", isFullEditor:true}).
+type LogEventParams struct {
+	EventName string         `json:"eventName"`
+	EventData map[string]any `json:"eventData"`
+}
+
 // Permission decision payloads returned for a can_use_tool request. The shape
 // matches the SDK's PermissionResult (behavior + updatedInput/message).
 type PermissionAllow struct {
