@@ -45,12 +45,14 @@ type Event struct {
 // Host drives a real claude binary as a stream-json child, impersonating the
 // VS Code extension's SDK transport.
 type Host struct {
-	claudePath    string
-	mcpServer     *ide.MCPServer // in-process IDE MCP server (nil = no IDE tools)
-	ideServerName string         // sdkMcpServers key the IDE tools are exposed under
-	extraArgs     []string       // passthrough flags (e.g. --model, --add-dir)
-	permission    PermissionFunc
-	logger        *log.Logger
+	claudePath     string
+	mcpServer      *ide.MCPServer  // in-process IDE MCP server (nil = no IDE tools)
+	ideServerName  string          // sdkMcpServers key the IDE tools are exposed under
+	commServer     *ide.CommServer // claude-vscode comm server (UI telemetry side channel)
+	commServerName string          // sdkMcpServers key the comm server is exposed under
+	extraArgs      []string        // passthrough flags (e.g. --model, --add-dir)
+	permission     PermissionFunc
+	logger         *log.Logger
 
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
@@ -91,15 +93,18 @@ func NewHost(cfg Config) *Host {
 	if ideName == "" {
 		ideName = "ide"
 	}
+	const commName = "claude-vscode"
 	return &Host{
-		claudePath:    cfg.ClaudePath,
-		mcpServer:     cfg.MCPServer,
-		ideServerName: ideName,
-		extraArgs:     cfg.ExtraArgs,
-		permission:    perm,
-		logger:        logger,
-		pending:       make(map[string]chan ControlResponseBody),
-		Events:        make(chan Event, 64),
+		claudePath:     cfg.ClaudePath,
+		mcpServer:      cfg.MCPServer,
+		ideServerName:  ideName,
+		commServer:     ide.NewCommServer(commName, logger),
+		commServerName: commName,
+		extraArgs:      cfg.ExtraArgs,
+		permission:     perm,
+		logger:         logger,
+		pending:        make(map[string]chan ControlResponseBody),
+		Events:         make(chan Event, 64),
 	}
 }
 
@@ -182,7 +187,7 @@ func (h *Host) Start(ctx context.Context) error {
 
 // Initialize sends the initialize control_request and waits for its receipt.
 func (h *Host) Initialize() error {
-	resp, err := h.sendControlRequest(InitializeRequest{Subtype: "initialize", SDKMcpServers: []string{h.ideServerName}})
+	resp, err := h.sendControlRequest(InitializeRequest{Subtype: "initialize", SDKMcpServers: []string{h.ideServerName, h.commServerName}})
 	if err != nil {
 		return err
 	}
@@ -198,6 +203,39 @@ func (h *Host) SendUserText(text string) error {
 	sid := h.sessionID
 	h.mu.Unlock()
 	return h.writeLine(NewUserText(sid, text))
+}
+
+// SendLogEvent fires a log_event notification to the claude-vscode comm server,
+// replicating the extension's per-session UI telemetry. The child folds it into
+// an internal metering event named tengu_vscode_<eventName>. eventData may be
+// nil (sent as an empty object). It blocks until the child acks the mcp_message
+// over the control channel (or the 30s control-request timeout elapses).
+func (h *Host) SendLogEvent(eventName string, eventData map[string]any) error {
+	if eventData == nil {
+		eventData = map[string]any{}
+	}
+	notif := JSONRPCNotification{
+		JSONRPC: "2.0",
+		Method:  "log_event",
+		Params:  LogEventParams{EventName: eventName, EventData: eventData},
+	}
+	msg, err := json.Marshal(notif)
+	if err != nil {
+		return err
+	}
+	resp, err := h.sendControlRequest(OutMCPMessageRequest{
+		Subtype:    CtlMCPMessage,
+		ServerName: h.commServerName,
+		Message:    msg,
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Subtype == "error" {
+		return fmt.Errorf("log_event %s failed: %s", eventName, resp.Error)
+	}
+	h.logger.Printf("sent log_event %s", eventName)
+	return nil
 }
 
 // Interrupt asks claude to abort the current turn.
@@ -381,11 +419,20 @@ func (h *Host) handleControlRequest(in InControlRequest) {
 		}
 		h.replyControlSuccess(in.RequestID, payload)
 	case CtlMCPMessage:
-		if h.mcpServer == nil || in.Request.ServerName != h.ideServerName {
+		var jsonrpcResp json.RawMessage
+		switch in.Request.ServerName {
+		case h.ideServerName:
+			if h.mcpServer == nil {
+				h.replyControlError(in.RequestID, "unknown mcp server: "+in.Request.ServerName)
+				return
+			}
+			jsonrpcResp = h.mcpServer.Handle(in.Request.Message)
+		case h.commServerName:
+			jsonrpcResp = h.commServer.Handle(in.Request.Message)
+		default:
 			h.replyControlError(in.RequestID, "unknown mcp server: "+in.Request.ServerName)
 			return
 		}
-		jsonrpcResp := h.mcpServer.Handle(in.Request.Message)
 		var payload json.RawMessage
 		if jsonrpcResp != nil {
 			payload, _ = json.Marshal(map[string]json.RawMessage{"mcp_response": jsonrpcResp})
