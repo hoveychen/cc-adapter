@@ -35,6 +35,7 @@ const (
 	TypeControlResponse      = "control_response"
 	TypeControlCancelRequest = "control_cancel_request"
 	TypeKeepAlive            = "keep_alive"
+	TypeRateLimitEvent       = "rate_limit_event"
 )
 
 // AgentMessage covers both "assistant" and "user" turns: a thin envelope around

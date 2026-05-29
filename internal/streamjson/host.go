@@ -323,8 +323,8 @@ func (h *Host) handleLine(line []byte) {
 				ch <- cr.Response
 			}
 		}
-	case TypeControlCancelRequest, TypeKeepAlive, TypeStreamEvent:
-		// no-op
+	case TypeControlCancelRequest, TypeKeepAlive, TypeStreamEvent, TypeRateLimitEvent:
+		// no-op (rate_limit_event carries throttling status we don't surface)
 	default:
 		h.logger.Printf("unknown message type: %q", t.Type)
 	}
