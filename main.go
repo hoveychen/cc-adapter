@@ -124,8 +124,11 @@ func run() int {
 
 	// Session-configuration flags pass through verbatim to the child claude. The
 	// child always runs in webview stream-json mode regardless of the downstream
-	// --output-format/--input-format the caller requested.
-	extra := opts.forward
+	// --output-format/--input-format the caller requested. dedupBaselineFlags
+	// drops any forwarded copy of a flag the Host baseline already supplies (e.g.
+	// the Agent SDK re-passing --verbose / --permission-prompt-tool stdio), so the
+	// child never gets duplicates.
+	extra := dedupBaselineFlags(opts.forward)
 
 	// --include-partial-messages / --replay-user-messages are adapter-owned (we
 	// consume them in parseArgs), but their effect is produced by the child: it

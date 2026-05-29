@@ -36,6 +36,47 @@ type cliOpts struct {
 // prompt returns the positional prompt, or "" if none was given.
 func (o cliOpts) prompt() string { return strings.Join(o.promptParts, " ") }
 
+// relayMode reports whether the downstream caller drives the full bidirectional
+// stream-json control protocol — i.e. the Claude Agent SDK's transport, which
+// spawns the "claude" executable with both --input-format and --output-format
+// negotiated as stream-json and then performs the initialize control handshake.
+// In that mode cc-adapter must behave as a faithful claude child (relay the
+// control channel up to the real claude and back), not the one-shot `claude -p`
+// output emulation that the other formats use.
+func (o cliOpts) relayMode() bool {
+	return o.inputFormat == "stream-json" && o.outputFormat == "stream-json"
+}
+
+// baselineChildFlags lists the flags that streamjson.Host.baselineArgs() always
+// supplies to the child claude, with the number of argv tokens each occupies
+// (flag + value). When the downstream caller (notably the Agent SDK) re-passes
+// any of these, the forwarded copy must be dropped or the child is handed a
+// duplicate — e.g. two `--permission-prompt-tool stdio` pairs, which the earlier
+// pass-through bug produced (the SDK's `--permission-prompt-tool stdio` was
+// forwarded as a bare boolean flag plus a stray `stdio` positional, on top of
+// the baseline copy). Keep this in sync with baselineArgs().
+var baselineChildFlags = map[string]int{
+	"--output-format":          2,
+	"--input-format":           2,
+	"--verbose":                1,
+	"--permission-prompt-tool": 2,
+}
+
+// dedupBaselineFlags removes from forward any flag (and its value tokens) that
+// the Host baseline already supplies, so the child never receives duplicates.
+// Unknown tokens pass through untouched.
+func dedupBaselineFlags(forward []string) []string {
+	out := make([]string, 0, len(forward))
+	for i := 0; i < len(forward); i++ {
+		if n, ok := baselineChildFlags[forward[i]]; ok {
+			i += n - 1 // skip this flag and any value tokens it consumes
+			continue
+		}
+		out = append(out, forward[i])
+	}
+	return out
+}
+
 // Flag arity tables for forwarded claude flags. We don't validate which flags
 // exist; we only need to know how many tokens each consumes so the positional
 // prompt is separated from flag values correctly. Unknown leading-dash tokens
@@ -48,6 +89,7 @@ var (
 		"--system-prompt": true, "--debug-file": true, "--effort": true,
 		"--fallback-model": true, "--json-schema": true, "--max-budget-usd": true,
 		"--model": true, "--name": true, "-n": true, "--permission-mode": true,
+		"--permission-prompt-tool": true,
 		"--remote-control-session-name-prefix": true, "--session-id": true,
 		"--setting-sources": true, "--settings": true,
 	}
