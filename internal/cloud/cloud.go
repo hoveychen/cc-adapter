@@ -23,11 +23,17 @@
 //     15s timeout. The org UUID comes from the stored credentials when present,
 //     otherwise from a profile (A3) lookup.
 //
-// TODO: A6 has three derived endpoints the extension also calls that are not
-// implemented here yet — GET /v1/sessions/{id}, GET
-// /v1/code/sessions/{id}/teleport-events, and GET
-// /v1/session_ingress/session/{id}. This batch implements only the /v1/sessions
-// list.
+// The three derived A6 endpoints the extension also calls share A6's t80 header
+// set and org-UUID resolution:
+//   - A6b session detail   — GET /v1/sessions/{id}                          (15s)
+//   - A6c teleport events  — GET /v1/code/sessions/{id}/teleport-events     (20s, paged)
+//   - A6d session ingress  — GET /v1/session_ingress/session/{id}           (20s)
+//
+// The teleport-events pagination is reverse-engineered verbatim from the
+// extension's fetchLogsViaCCR (extension.js, build 2.1.156): query params
+// {limit: 1000, cursor: <next_cursor>}, response root carries .data (an array of
+// {payload} events) and .next_cursor; the loop stops when next_cursor is falsy
+// and is capped at 100 pages. See teleportPageLimit / teleportMaxPages below.
 package cloud
 
 import (
@@ -35,7 +41,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -48,6 +56,20 @@ const (
 	usageTimeout    = 5 * time.Second
 	profileTimeout  = 10 * time.Second
 	sessionsTimeout = 15 * time.Second
+	// A6b session detail shares A6's 15s budget.
+	sessionDetailTimeout = 15 * time.Second
+	// A6c teleport events / A6d session ingress both use 20s (confirmed from
+	// extension.js: timeout:20000 on both fetchLogsViaCCR and
+	// fetchLogsViaSessionIngress).
+	teleportTimeout = 20 * time.Second
+	ingressTimeout  = 20 * time.Second
+)
+
+// Teleport-events pagination constants, confirmed from extension.js
+// fetchLogsViaCCR: limit=1000 per page, capped at 100 pages.
+const (
+	teleportPageLimit = 1000
+	teleportMaxPages  = 100
 )
 
 // httpClient is the client used for all cloud requests; overridable in tests via
@@ -180,11 +202,13 @@ func Profile() (orgUUID string, raw []byte, err error) {
 	return parsed.Organization.UUID, raw, nil
 }
 
-// RemoteSessions implements A6: GET {base}/v1/sessions with the t80-style header
-// set. It ensures an organization UUID is available first (preferring the stored
-// credential, falling back to an A3 profile lookup) and sends it as
-// x-organization-uuid. Returns the raw JSON body.
-func RemoteSessions() ([]byte, error) {
+// t80Headers builds the shared "t80"-style header set the A6 family of endpoints
+// carries on top of the OAuth headers: the fixed anthropic-version /
+// anthropic-beta / Content-Type plus x-organization-uuid. It resolves the
+// organization UUID the same way RemoteSessions does — preferring the stored
+// credential, falling back to an A3 profile lookup — and is shared by all four
+// A6 endpoints (list + the three derived ones).
+func t80Headers() (map[string]string, error) {
 	orgUUID := loadOrgUUID()
 	if orgUUID == "" {
 		var err error
@@ -193,10 +217,111 @@ func RemoteSessions() ([]byte, error) {
 			return nil, fmt.Errorf("resolving organization uuid via profile: %w", err)
 		}
 	}
-	return doGet("/v1/sessions", map[string]string{
+	return map[string]string{
 		"Content-Type":        "application/json",
 		"anthropic-version":   "2023-06-01",
 		"anthropic-beta":      "ccr-byoc-2025-07-29",
 		"x-organization-uuid": orgUUID,
-	}, sessionsTimeout)
+	}, nil
+}
+
+// RemoteSessions implements A6: GET {base}/v1/sessions with the t80-style header
+// set. Returns the raw JSON body.
+func RemoteSessions() ([]byte, error) {
+	hdrs, err := t80Headers()
+	if err != nil {
+		return nil, err
+	}
+	return doGet("/v1/sessions", hdrs, sessionsTimeout)
+}
+
+// SessionDetail implements A6b: GET {base}/v1/sessions/{id} with the t80-style
+// header set. A 404 (or any other non-2xx) is not treated as an error — the body
+// is returned verbatim, consistent with doGet's passthrough behaviour.
+func SessionDetail(id string) ([]byte, error) {
+	hdrs, err := t80Headers()
+	if err != nil {
+		return nil, err
+	}
+	return doGet("/v1/sessions/"+url.PathEscape(id), hdrs, sessionDetailTimeout)
+}
+
+// teleportPage is the response shape for a single teleport-events page. Each
+// element of Data carries a Payload (the actual event); NextCursor advances the
+// pagination and is empty/absent on the final page. Both names are confirmed
+// from extension.js (H.data.data, L.payload, H.data.next_cursor).
+type teleportPage struct {
+	Data []struct {
+		Payload json.RawMessage `json:"payload"`
+	} `json:"data"`
+	NextCursor string `json:"next_cursor"`
+}
+
+// TeleportEvents implements A6c: GET {base}/v1/code/sessions/{id}/teleport-events
+// with the t80-style header set, aggregating all pages into a single JSON array
+// of event payloads. Pagination is confirmed from extension.js fetchLogsViaCCR:
+// query params {limit:1000, cursor:<next_cursor>}, response {data:[{payload}],
+// next_cursor}; the loop stops when next_cursor is falsy and is capped at 100
+// pages (logging a truncation notice if the cap is hit).
+//
+// Unlike the raw-passthrough endpoints, a non-2xx page cannot be aggregated, so
+// it is surfaced: the first page's body is returned verbatim with an error so
+// the caller still sees the server's message (e.g. a 404 body).
+func TeleportEvents(id string) ([]byte, error) {
+	hdrs, err := t80Headers()
+	if err != nil {
+		return nil, err
+	}
+
+	basePath := "/v1/code/sessions/" + url.PathEscape(id) + "/teleport-events"
+	events := []json.RawMessage{}
+	cursor := ""
+
+	for page := 0; page < teleportMaxPages; page++ {
+		q := url.Values{}
+		q.Set("limit", fmt.Sprintf("%d", teleportPageLimit))
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		body, err := doGet(basePath+"?"+q.Encode(), hdrs, teleportTimeout)
+		if err != nil {
+			return nil, err
+		}
+
+		var pg teleportPage
+		if err := json.Unmarshal(body, &pg); err != nil {
+			// A non-2xx (e.g. 404) body won't match the page shape. On the very
+			// first page there's nothing aggregated yet, so surface the raw body
+			// with the parse error; on a later page, stop and return what we have.
+			if page == 0 {
+				return body, fmt.Errorf("parsing teleport-events page 0: %w", err)
+			}
+			break
+		}
+
+		for _, e := range pg.Data {
+			if len(e.Payload) > 0 {
+				events = append(events, e.Payload)
+			}
+		}
+
+		cursor = pg.NextCursor
+		if cursor == "" {
+			return json.Marshal(events)
+		}
+	}
+
+	log.Printf("cc-adapter: teleport-events for %s hit the %d-page cap; results truncated", id, teleportMaxPages)
+	return json.Marshal(events)
+}
+
+// SessionIngress implements A6d: GET {base}/v1/session_ingress/session/{id} with
+// the t80-style header set. The raw body is returned verbatim (a 404 body is not
+// an error), consistent with doGet's passthrough behaviour.
+func SessionIngress(id string) ([]byte, error) {
+	hdrs, err := t80Headers()
+	if err != nil {
+		return nil, err
+	}
+	return doGet("/v1/session_ingress/session/"+url.PathEscape(id), hdrs, ingressTimeout)
 }

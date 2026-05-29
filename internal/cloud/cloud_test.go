@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -186,6 +187,141 @@ func TestRemoteSessionsFetchesProfileWhenNoStoredOrgUUID(t *testing.T) {
 	}
 	if got := lastSessionsHeader.Get("x-organization-uuid"); got != "profile-org-777" {
 		t.Errorf("x-organization-uuid = %q, want profile-org-777 (from profile fallback)", got)
+	}
+}
+
+func TestSessionDetail(t *testing.T) {
+	_, captured := newFakeServer(t, 200, `{"id":"sess-abc","title":"t"}`)
+	SetOrgUUIDLoader(func() string { return "org-1" })
+
+	body, err := SessionDetail("sess-abc")
+	if err != nil {
+		t.Fatalf("SessionDetail: %v", err)
+	}
+	if string(body) != `{"id":"sess-abc","title":"t"}` {
+		t.Errorf("body = %q", body)
+	}
+	if captured.path != "/v1/sessions/sess-abc" {
+		t.Errorf("path = %q, want /v1/sessions/sess-abc", captured.path)
+	}
+	if got := captured.header.Get("anthropic-version"); got != "2023-06-01" {
+		t.Errorf("anthropic-version = %q, want 2023-06-01", got)
+	}
+	if got := captured.header.Get("anthropic-beta"); got != "ccr-byoc-2025-07-29" {
+		t.Errorf("anthropic-beta = %q, want ccr-byoc-2025-07-29", got)
+	}
+	if got := captured.header.Get("x-organization-uuid"); got != "org-1" {
+		t.Errorf("x-organization-uuid = %q, want org-1", got)
+	}
+	if got := captured.header.Get("Authorization"); got != "Bearer fake-access-token" {
+		t.Errorf("Authorization = %q", got)
+	}
+}
+
+func TestSessionDetail404PassedThrough(t *testing.T) {
+	// A 404 body must be returned verbatim, not turned into a Go error.
+	_, _ = newFakeServer(t, 404, `{"error":"not found"}`)
+	SetOrgUUIDLoader(func() string { return "org-1" })
+
+	body, err := SessionDetail("missing")
+	if err != nil {
+		t.Fatalf("SessionDetail returned error for 404, want passthrough: %v", err)
+	}
+	if string(body) != `{"error":"not found"}` {
+		t.Errorf("body = %q, want 404 body passed through", body)
+	}
+}
+
+func TestSessionIngress(t *testing.T) {
+	_, captured := newFakeServer(t, 200, `{"loglines":["a","b"]}`)
+	SetOrgUUIDLoader(func() string { return "org-2" })
+
+	body, err := SessionIngress("sess-xyz")
+	if err != nil {
+		t.Fatalf("SessionIngress: %v", err)
+	}
+	if string(body) != `{"loglines":["a","b"]}` {
+		t.Errorf("body = %q", body)
+	}
+	if captured.path != "/v1/session_ingress/session/sess-xyz" {
+		t.Errorf("path = %q, want /v1/session_ingress/session/sess-xyz", captured.path)
+	}
+	if got := captured.header.Get("anthropic-version"); got != "2023-06-01" {
+		t.Errorf("anthropic-version = %q", got)
+	}
+	if got := captured.header.Get("x-organization-uuid"); got != "org-2" {
+		t.Errorf("x-organization-uuid = %q, want org-2", got)
+	}
+}
+
+// TestTeleportEventsPagination drives a fake server returning 3 pages: pages 0
+// and 1 carry events plus a next_cursor, the final page has events and no
+// cursor. It asserts the aggregated event count equals the sum of all pages,
+// that the cursor returned by page N is sent on page N+1, and that limit=1000
+// rides every request.
+func TestTeleportEventsPagination(t *testing.T) {
+	var sawCursors []string
+	var sawLimits []string
+	pageBodies := []string{
+		`{"data":[{"payload":{"e":1}},{"payload":{"e":2}}],"next_cursor":"c1"}`,
+		`{"data":[{"payload":{"e":3}}],"next_cursor":"c2"}`,
+		`{"data":[{"payload":{"e":4}},{"payload":{"e":5}}]}`, // no next_cursor -> last page
+	}
+	page := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/code/sessions/s1/teleport-events" {
+			w.WriteHeader(404)
+			return
+		}
+		sawCursors = append(sawCursors, r.URL.Query().Get("cursor"))
+		sawLimits = append(sawLimits, r.URL.Query().Get("limit"))
+		idx := page
+		if idx >= len(pageBodies) {
+			idx = len(pageBodies) - 1
+		}
+		_, _ = w.Write([]byte(pageBodies[idx]))
+		page++
+	}))
+	t.Cleanup(func() {
+		srv.Close()
+		SetHTTPClient(&http.Client{})
+		SetAuthHeaders(nil)
+		SetOrgUUIDLoader(nil)
+	})
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	SetHTTPClient(srv.Client())
+	SetAuthHeaders(func() (map[string]string, error) {
+		return map[string]string{"Authorization": "Bearer fake-access-token"}, nil
+	})
+	SetOrgUUIDLoader(func() string { return "org-3" })
+
+	body, err := TeleportEvents("s1")
+	if err != nil {
+		t.Fatalf("TeleportEvents: %v", err)
+	}
+
+	var events []map[string]int
+	if err := json.Unmarshal(body, &events); err != nil {
+		t.Fatalf("unmarshal aggregated events: %v (body=%s)", err, body)
+	}
+	if len(events) != 5 {
+		t.Errorf("aggregated event count = %d, want 5 (2+1+2)", len(events))
+	}
+
+	// Three requests should have been made: cursor "" then "c1" then "c2".
+	wantCursors := []string{"", "c1", "c2"}
+	if len(sawCursors) != len(wantCursors) {
+		t.Fatalf("request count = %d, want %d (cursors seen: %v)", len(sawCursors), len(wantCursors), sawCursors)
+	}
+	for i, want := range wantCursors {
+		if sawCursors[i] != want {
+			t.Errorf("page %d cursor = %q, want %q", i, sawCursors[i], want)
+		}
+	}
+	for i, lim := range sawLimits {
+		if lim != "1000" {
+			t.Errorf("page %d limit = %q, want 1000", i, lim)
+		}
 	}
 }
 

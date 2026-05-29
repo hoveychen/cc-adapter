@@ -70,6 +70,8 @@ func run() int {
 		switch args[0] {
 		case "usage", "profile", "sessions":
 			return runCloud(args[0])
+		case "session", "teleport-events", "session-ingress":
+			return runCloudWithID(args[0], args[1:])
 		case "voice":
 			return runVoice()
 		}
@@ -233,6 +235,44 @@ func runCloud(cmd string) int {
 		_, out, err = cloud.Profile()
 	case "sessions":
 		out, err = cloud.RemoteSessions()
+	default:
+		fmt.Fprintf(os.Stderr, "cc-adapter: unknown cloud subcommand %q\n", cmd)
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cc-adapter %s: %v\n", cmd, err)
+		return 1
+	}
+	os.Stdout.Write(out)
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		fmt.Println()
+	}
+	return 0
+}
+
+// runCloudWithID dispatches a parameterized A6-derived cloud subcommand
+// (session / teleport-events / session-ingress), each requiring a session id as
+// rest[0]. It prints the raw response body to stdout and returns the exit code.
+// A missing id prints usage to stderr and returns 1; errors print to stderr and
+// return 1. It never starts the stream-json host.
+func runCloudWithID(cmd string, rest []string) int {
+	if len(rest) < 1 || rest[0] == "" {
+		fmt.Fprintf(os.Stderr, "cc-adapter: %s requires a session id\nusage: cc-adapter %s <id>\n", cmd, cmd)
+		return 1
+	}
+	id := rest[0]
+
+	var (
+		out []byte
+		err error
+	)
+	switch cmd {
+	case "session":
+		out, err = cloud.SessionDetail(id)
+	case "teleport-events":
+		out, err = cloud.TeleportEvents(id)
+	case "session-ingress":
+		out, err = cloud.SessionIngress(id)
 	default:
 		fmt.Fprintf(os.Stderr, "cc-adapter: unknown cloud subcommand %q\n", cmd)
 		return 1
