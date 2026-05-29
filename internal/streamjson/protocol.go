@@ -198,8 +198,10 @@ type ControlResponseBody struct {
 }
 
 // InitializeRequest is the body of the initialize control_request we send right
-// after spawn. We declare no hooks and no SDK-side MCP servers (the IDE server
-// is reached via the lockfile + CLAUDE_CODE_SSE_PORT, not via sdkMcpServers).
+// after spawn. We declare no hooks and the IDE in-process MCP server via
+// sdkMcpServers (e.g. ["ide"]); the CLI then exposes its tools as mcp__ide__*
+// and reaches them by tunneling JSON-RPC over control mcp_message frames (the
+// default-webview-mode mechanism, not the terminal-mode WebSocket+lockfile).
 type InitializeRequest struct {
 	Subtype       string   `json:"subtype"` // "initialize"
 	Hooks         struct{} `json:"hooks"`
