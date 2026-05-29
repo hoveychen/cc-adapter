@@ -210,6 +210,10 @@ func Refresh(refreshToken string) (*Credentials, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Match the extension's axios client UA (VERSION 1.9.0); the A4 token refresh
+	// goes through the same axios instance as A1-A6, so it must not leak
+	// Go-http-client/1.1 either.
+	req.Header.Set("User-Agent", "axios/1.9.0")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
