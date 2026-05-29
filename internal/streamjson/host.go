@@ -53,6 +53,7 @@ type Host struct {
 	extraArgs      []string        // passthrough flags (e.g. --model, --add-dir)
 	permission     PermissionFunc
 	rawSink        func([]byte) // optional: receives every raw stdout line (incl. trailing newline)
+	relayMode      bool         // when true, readLoop hands raw lines to rawSink only (no decode/auto-handle)
 	logger         *log.Logger
 
 	cmd     *exec.Cmd
@@ -83,6 +84,14 @@ type Config struct {
 	// line is decoded into an Event. Used by the print path to forward or capture
 	// frames at full fidelity (e.g. --output-format stream-json / json).
 	RawSink func([]byte)
+
+	// RelayMode makes the Host a pure upstream transport for the SDK-driven relay:
+	// readLoop delivers every raw claude stdout line to RawSink and does NOT decode
+	// it into Events or auto-answer control_requests. The caller (relay.go) owns
+	// all routing — forwarding frames to/from the downstream SDK, handling the
+	// in-process IDE/comm MCP servers, and injecting the claude_launched log_event.
+	// The Host still owns spawn + the vscode env/baseline, which is the point.
+	RelayMode bool
 }
 
 // NewHost prepares (but does not start) a Host.
@@ -110,6 +119,7 @@ func NewHost(cfg Config) *Host {
 		extraArgs:      cfg.ExtraArgs,
 		permission:     perm,
 		rawSink:        cfg.RawSink,
+		relayMode:      cfg.RelayMode,
 		logger:         logger,
 		pending:        make(map[string]chan ControlResponseBody),
 		Events:         make(chan Event, 64),
@@ -260,6 +270,100 @@ func (h *Host) Interrupt() error {
 	return err
 }
 
+// --- relay support (SDK-driven mode) ---
+
+// RelayIDPrefix is the request_id prefix relayID() stamps on control_requests
+// the relay itself originates upstream (e.g. the claude_launched log_event). The
+// relay matches upstream control_responses against it to recognise its own
+// injected requests and drop their acks rather than forwarding them downstream.
+const RelayIDPrefix = "cca_"
+
+// WriteUpstreamRaw writes an already-encoded NDJSON frame to claude's stdin
+// verbatim, appending a trailing newline if absent. The relay uses it to forward
+// downstream SDK frames (user turns, control_requests/responses) upstream.
+func (h *Host) WriteUpstreamRaw(line []byte) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	if _, err := h.stdin.Write(line); err != nil {
+		return err
+	}
+	if n := len(line); n == 0 || line[n-1] != '\n' {
+		if _, err := h.stdin.Write([]byte{'\n'}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WriteUpstream marshals v and writes it as one NDJSON frame to claude's stdin.
+func (h *Host) WriteUpstream(v any) error { return h.writeLine(v) }
+
+// IDEServerName and CommServerName expose the in-process MCP server names so the
+// relay can decide which sdkMcpServers to inject into the merged initialize and
+// which mcp_message frames to service locally vs forward to the SDK.
+func (h *Host) IDEServerName() string  { return h.ideServerName }
+func (h *Host) CommServerName() string { return h.commServerName }
+
+// HasIDEServer reports whether the in-process IDE MCP server is enabled (false
+// under -no-ide). When false the relay must not inject "ide" into sdkMcpServers.
+func (h *Host) HasIDEServer() bool { return h.mcpServer != nil }
+
+// InProcMCP routes a tunneled JSON-RPC message to one of the Host's in-process
+// MCP servers (the IDE server or the claude-vscode comm server) and returns the
+// JSON-RPC response. ok is false when serverName matches neither — the relay
+// then forwards the mcp_message down to the SDK, which owns that server. A nil
+// response (ok=true) denotes a notification with no JSON-RPC reply.
+func (h *Host) InProcMCP(serverName string, message json.RawMessage) (resp json.RawMessage, ok bool) {
+	switch serverName {
+	case h.ideServerName:
+		if h.mcpServer == nil {
+			return nil, false
+		}
+		return h.mcpServer.Handle(message), true
+	case h.commServerName:
+		return h.commServer.Handle(message), true
+	}
+	return nil, false
+}
+
+// SendLogEventAsync fires a log_event notification to the claude-vscode comm
+// server (replicating the extension's per-session UI telemetry) WITHOUT blocking
+// on the child's control_response. The request_id carries RelayIDPrefix so the
+// relay recognises and drops the ack on the upstream side. Used in relay mode,
+// where the read loop does not drive the synchronous pending-response machinery
+// that SendLogEvent relies on.
+func (h *Host) SendLogEventAsync(eventName string, eventData map[string]any) error {
+	if eventData == nil {
+		eventData = map[string]any{}
+	}
+	notif := JSONRPCNotification{
+		JSONRPC: "2.0",
+		Method:  "log_event",
+		Params:  LogEventParams{EventName: eventName, EventData: eventData},
+	}
+	msg, err := json.Marshal(notif)
+	if err != nil {
+		return err
+	}
+	return h.writeLine(OutControlRequest{
+		Type:      TypeControlRequest,
+		RequestID: h.relayID(),
+		Request: OutMCPMessageRequest{
+			Subtype:    CtlMCPMessage,
+			ServerName: h.commServerName,
+			Message:    msg,
+		},
+	})
+}
+
+// relayID returns a request_id namespaced with RelayIDPrefix.
+func (h *Host) relayID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.reqSeq++
+	return fmt.Sprintf("%s%d", RelayIDPrefix, h.reqSeq)
+}
+
 // CloseInput closes claude's stdin, signalling end-of-input so it can exit
 // gracefully after finishing in-flight work.
 func (h *Host) CloseInput() error {
@@ -334,7 +438,11 @@ func (h *Host) readLoop() {
 			if h.rawSink != nil {
 				h.rawSink(line)
 			}
-			h.handleLine(line)
+			// In relay mode the caller (relay.go) owns all routing via RawSink;
+			// the Host does not decode frames into Events or auto-answer control.
+			if !h.relayMode {
+				h.handleLine(line)
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
