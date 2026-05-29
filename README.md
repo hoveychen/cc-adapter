@@ -1,28 +1,28 @@
 # cc-adapter
 
-像 VS Code「Claude Code」扩展一样驱动真实的 `claude` 二进制。
+Drives the real `claude` binary the way the VS Code "Claude Code" extension does.
 
-`cc-adapter` 以 `CLAUDE_CODE_ENTRYPOINT=claude-vscode` 把真实 `claude` 作为双向 stream-json 子进程拉起，并把 IDE 工具注册为进程内 MCP server、会话启动发 `claude_launched` 遥测——从 Anthropic 后台看，这条流量被归因为 `claude_code_vscode`，与真实 VS Code 会话一致。
+`cc-adapter` spawns the real `claude` as a bidirectional stream-json child with `CLAUDE_CODE_ENTRYPOINT=claude-vscode`, registers the IDE tools as an in-process MCP server, and emits a `claude_launched` telemetry event on session start — so from Anthropic's backend the traffic is attributed to `claude_code_vscode`, identical to a real VS Code session.
 
-两种用法：
+Two ways to use it:
 
-- **当 CLI 用**：直接 `cc-adapter "prompt"`，它自己当 host 起一个 vscode 会话。
-- **当官方 Claude Agent SDK 的 `claude` 用**：把 SDK 的可执行文件路径指向 `cc-adapter`，SDK 即可像驱动真 claude 一样驱动它，而上游会话仍是完整 vscode 会话。
+- **As a CLI**: run `cc-adapter "prompt"` directly; it acts as the host and starts a vscode session itself.
+- **As the `claude` binary for the official Claude Agent SDK**: point the SDK's executable path at `cc-adapter`, and the SDK drives it exactly as it would the real claude — while the upstream session stays a full vscode session.
 
-> 内部原理（control 协议、双向中继、流量指纹、A1–A6 复刻）见 [docs/OVERVIEW.md](docs/OVERVIEW.md) 与 [docs/reverse-engineering.md](docs/reverse-engineering.md)。
+> Internals (control protocol, bidirectional relay, traffic fingerprint, A1–A6 replication) are in [docs/OVERVIEW.md](docs/OVERVIEW.md) and [docs/reverse-engineering.md](docs/reverse-engineering.md).
 
-## 构建
+## Build
 
 ```bash
 go build -o cc-adapter .
 ```
 
-真实 `claude` 二进制解析顺序：`-claude-bin` > `$CLAUDE_REAL_BIN` > `PATH` 上的 `claude`。VS Code 扩展自带一个现成的：
-`~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude`。
+Real `claude` binary resolution order: `-claude-bin` > `$CLAUDE_REAL_BIN` > `claude` on `PATH`. The VS Code extension ships a ready-to-use one at:
+`~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude`.
 
-## 集成：用官方 Claude Agent SDK 驱动
+## Integrate: drive it with the official Claude Agent SDK
 
-把 SDK 的可执行文件路径指向 `cc-adapter`，并用 `env` 给出真实 claude 的位置（`CLAUDE_REAL_BIN`）。SDK 那边无需改动，归因与 IDE 指纹全部到位。
+Point the SDK's executable path at `cc-adapter` and use `env` to tell it where the real claude is (`CLAUDE_REAL_BIN`). The SDK needs no other changes; the attribution and IDE fingerprint are all in place.
 
 ```python
 # Python — claude-agent-sdk
@@ -52,36 +52,36 @@ for await (const msg of query({
 }
 ```
 
-多轮对话、工具调用、SDK 自有 MCP server、hooks 均原样工作；`mcp__ide__*` 工具与 `ide` / `claude-vscode` server 在会话里可见且 `connected`。已用 Python（0.2.87）与 TypeScript（0.3.153）官方 SDK 端到端验证。
+Multi-turn conversations, tool calls, the SDK's own in-process MCP servers, and hooks all work unchanged; the `mcp__ide__*` tools and the `ide` / `claude-vscode` servers show up `connected` in the session. Verified end-to-end with the Python (0.2.87) and TypeScript (0.3.153) official SDKs.
 
-## 集成：当 CLI 用
+## Integrate: use it as a CLI
 
 ```bash
-# 一次性 prompt：发送、打印结果、退出
+# One-shot prompt: send, print the result, exit
 ./cc-adapter "fix the bug in main.go"
 
-# 交互 REPL：每行 stdin 作为一个 user turn
+# Interactive REPL: one stdin line per user turn
 ./cc-adapter
 
-# claude -p 兼容面（上游始终是完整 vscode 会话）
+# claude -p compatible surface (upstream is always a full vscode session)
 ./cc-adapter -p "summarize"
 ./cc-adapter -p --output-format json "..."
 ./cc-adapter -p --model claude-opus-4-8 --permission-mode plan "..."
 
-# 复刻插件功能性请求（需已登录的 OAuth 凭据）
+# Replicate the extension's functional requests (needs logged-in OAuth credentials)
 ./cc-adapter usage | profile | sessions | session <id> | voice
 ```
 
-会话类用法支持透传任意 claude 会话 flag（`--model`、`--add-dir`、`--system-prompt`、`--permission-mode` 等），原样转发给子进程。
+Session-style usage forwards any claude session flag (`--model`, `--add-dir`, `--system-prompt`, `--permission-mode`, …) verbatim to the child.
 
 ## Flags
 
-| flag | 作用 |
+| flag | effect |
 |---|---|
-| `-claude-bin <path>` | 指定真实 claude 二进制 |
-| `-model <m>` | 透传 `--model` 给 claude |
-| `-no-ide` | 不起 IDE 侧信道（计费归因仍生效） |
-| `-deny-writes` | 拒绝写类工具（Write/Edit/MultiEdit/NotebookEdit/Bash） |
-| `-no-telemetry` | 关闭 A1 异常遥测（event_logging）|
+| `-claude-bin <path>` | specify the real claude binary |
+| `-model <m>` | forward `--model` to claude |
+| `-no-ide` | don't start the IDE side channel (billing attribution still applies) |
+| `-deny-writes` | deny write tools (Write/Edit/MultiEdit/NotebookEdit/Bash) |
+| `-no-telemetry` | disable the A1 failure telemetry (event_logging) |
 
-权限默认全部放行（headless 自动化无人交互）；`-deny-writes` 是保守开关。
+Permissions default to allow-all (headless automation with no human to prompt); `-deny-writes` is the conservative switch.

@@ -1,111 +1,111 @@
-# cc-adapter 总览（架构 / 流量指纹 / 用法）
+# cc-adapter Overview (Architecture / Traffic Fingerprint / Usage)
 
-## 它是什么
+## What It Is
 
-`cc-adapter` 是一个 Go 程序，把真实的 `claude` 二进制当 stream-json 子进程驱动，并**完整复刻 VS Code「Claude Code」扩展（v2.1.156）对 Anthropic 发起的全部网络互动**。目标：从 Anthropic 后台看，cc-adapter 产生的流量指纹 = 100% 真 VS Code 插件。
+`cc-adapter` is a Go program that drives the real `claude` binary as a stream-json child process and **faithfully reproduces every network interaction the VS Code "Claude Code" extension (v2.1.156) makes against Anthropic**. The goal: as seen from Anthropic's backend, the traffic fingerprint produced by cc-adapter = 100% the genuine VS Code extension.
 
-真插件 = **extension 进程**（自己发的遥测/功能请求）+ **spawn 的 claude 子进程**（messages + tengu 遥测）。cc-adapter 把两半都复刻。
+The genuine extension = the **extension process** (telemetry/feature requests it sends itself) + the **spawned claude child process** (messages + tengu telemetry). cc-adapter reproduces both halves.
 
-## 架构
+## Architecture
 
 ```
 cc-adapter (Go)
-├── main.go                  入口：host 模式 + 子命令分流
-├── internal/streamjson/     stream-json host：spawn claude、读写循环、control 通道
-│                            （mcp_message 隧道 + log_event 主动下发）
-├── internal/ide/            IDE 工具 MCP server（12 工具）+ CommServer（claude-vscode 通信 server）
-├── internal/auth/           OAuth：读 credentials/keychain、JWT 解 account_uuid、token 刷新(A4)
-├── internal/telemetry/      A1 event_logging 匿名遥测（ClaudeCodeInternalEvent）
-├── internal/cloud/          A2 usage / A3 profile / A6 sessions(+3衍生端点) oauth GET
-└── internal/voice/          A5 voice_stream WebSocket 客户端
+├── main.go                  entry point: host mode + subcommand dispatch
+├── internal/streamjson/     stream-json host: spawn claude, read/write loop, control channel
+│                            (mcp_message tunnel + active log_event push)
+├── internal/ide/            IDE tools MCP server (12 tools) + CommServer (claude-vscode communication server)
+├── internal/auth/           OAuth: read credentials/keychain, decode account_uuid from JWT, token refresh (A4)
+├── internal/telemetry/      A1 event_logging anonymous telemetry (ClaudeCodeInternalEvent)
+├── internal/cloud/          A2 usage / A3 profile / A6 sessions (+3 derived endpoints) oauth GET
+└── internal/voice/          A5 voice_stream WebSocket client
 ```
 
-**双边设计**：上游（真 claude + Anthropic 后台）永远看到一个完整 VS Code webview 会话；下游（调用方）看到一个 `claude -p` 兼容接口。两边的不匹配正是 adapter 的价值——把廉价的 `claude -p` 用法桥接到完整 VS Code 会话上。
+**Two-sided design**: upstream (the real claude + Anthropic backend) always sees a complete VS Code webview session; downstream (the caller) sees a `claude -p` compatible interface. The mismatch between the two sides is exactly the adapter's value—bridging cheap `claude -p` usage onto a full VS Code session.
 
-子进程**恒**以 VS Code 默认 **webview 模式**拉起（无论下游传什么，都不是 `claude -p`）：
+The child process is **always** brought up in VS Code's default **webview mode** (no matter what downstream passes, it is never `claude -p`):
 ```
 claude --output-format stream-json --input-format stream-json --verbose --permission-prompt-tool stdio
 ```
-注入 env：`CLAUDE_CODE_ENTRYPOINT=claude-vscode`（计费归因核心）、`MCP_CONNECTION_NONBLOCKING=true`、`CLAUDE_CODE_ENABLE_TASKS=0`、`CLAUDE_AGENT_SDK_VERSION=0.3.156`，删除 `NODE_OPTIONS`。
+Injected env: `CLAUDE_CODE_ENTRYPOINT=claude-vscode` (the core of billing attribution), `MCP_CONNECTION_NONBLOCKING=true`, `CLAUDE_CODE_ENABLE_TASKS=0`, `CLAUDE_AGENT_SDK_VERSION=0.3.156`, and removes `NODE_OPTIONS`.
 
-下游的 `-p` / `--output-format` / `--input-format` 只决定 adapter 怎么跟**调用方**说话：adapter 通过 host 的 RawSink 把子进程的 stream-json 帧重新呈现给下游——`text` 打最终 result 文本，`json` 透出 result 帧，`stream-json` 逐帧透出（过滤掉 control 通道帧，使之与真 `claude -p` 一致）。除 I/O 类与管理类 flag 外，其余 claude 会话 flag（`--model`、`--add-dir`、`--system-prompt`、`--permission-mode` 等）原样转发给子进程，无需逐个白名单。
+Downstream's `-p` / `--output-format` / `--input-format` only decide how the adapter talks to the **caller**: the adapter re-presents the child process's stream-json frames to downstream through the host's RawSink—`text` prints the final result text, `json` forwards the result frame, `stream-json` forwards frame by frame (filtering out control-channel frames so it matches the real `claude -p`). Apart from the I/O-class and management-class flags, all other claude session flags (`--model`, `--add-dir`, `--system-prompt`, `--permission-mode`, etc.) are forwarded verbatim to the child process, without needing a per-flag allowlist.
 
-**SDK-driven relay 模式**：当下游 in/out 都是 `stream-json`（即官方 Claude Agent SDK 的双向控制协议传输）时，adapter 不再做上面这套单向 `claude -p` 呈现，而是进入 `relay.go` 的**双向 control 中继**：在 SDK（父）与真 claude（子）之间忠实转发每一帧，并把 SDK 的 `initialize` 与 cc-adapter 的 `ide`+`claude-vscode` 进程内 server 合并、按 server_name 路由 `mcp_message`、注入 `claude_launched`，从而让 SDK 能把 cc-adapter 当 claude 驱动，上游仍是完整 vscode 会话。两个协议细节：`-v`/`--version` 透传给真 claude（SDK 版本预检），claude 的 stdin 保持到 `result` 帧才关（control 协议要求全程开）。详见 README「用官方 Claude Agent SDK 驱动」。
+**SDK-driven relay mode**: when both downstream in/out are `stream-json` (i.e. the official Claude Agent SDK's bidirectional control-protocol transport), the adapter no longer does the one-way `claude -p` presentation above, but instead enters the **bidirectional control relay** in `relay.go`: it faithfully forwards every frame between the SDK (parent) and the real claude (child), and merges the SDK's `initialize` with cc-adapter's in-process `ide` + `claude-vscode` servers, routes `mcp_message` by server_name, and injects `claude_launched`, so that the SDK can drive cc-adapter as claude while upstream is still a complete vscode session. Two protocol details: `-v`/`--version` is passed through to the real claude (SDK version pre-check), and claude's stdin is kept open until the `result` frame (the control protocol requires it open throughout). See the README section "Driving with the official Claude Agent SDK" for details.
 
-## 流量指纹对照（cc-adapter vs 真插件）
+## Traffic Fingerprint Comparison (cc-adapter vs the genuine extension)
 
-| 请求 | 真插件触发 | cc-adapter 复刻 | 验证 |
+| Request | Genuine extension trigger | cc-adapter reproduction | Verification |
 |---|---|---|---|
-| **messages + tengu 遥测** | 子进程恒发 | spawn entrypoint=claude-vscode → `anthropic-client-platform: claude_code_vscode`、UA `claude-cli/2.1.156 (external, claude-vscode, agent-sdk/0.3.156)` | 真环境抓包逐字 ✓ |
-| **log_event**（claude_launched 等） | 会话启动 MCP 通知 | 注册 `claude-vscode` 通信 server，会话启动发 log_event notification → 子进程折成 `tengu_vscode_<name>` | smoke 投递 acked ✓ |
-| **IDE 工具**（mcp__ide__*） | sdkMcpServer | in-process MCP server，经 control 通道 mcp_message 往返 | smoke `ide connected` ✓ |
-| **A1** event_logging | spawn 失败/子进程异常退出 | `internal/telemetry` 匿名 POST（无 auth，x-service-name:claude-code，gate DISABLE_*） | 单测 ✓ |
-| **A2** usage | 用户看用量 | `cc-adapter usage` | 真调到 API ✓ |
-| **A3** profile | teleport 取 org | `cc-adapter profile` | 单测 ✓ |
-| **A4** oauth refresh | token 过期 | `internal/auth` 自动刷新（platform.claude.com） | 单测 ✓ |
-| **A5** voice WS | 语音输入 | `cc-adapter voice`（stdin PCM 16k mono） | 单测+假WS握手 ✓ |
-| **A6** sessions + 3 衍生 | remote/teleport | `cc-adapter sessions` / `session <id>` / `teleport-events <id>` / `session-ingress <id>` | 单测（含分页聚合）✓ |
+| **messages + tengu telemetry** | Child process always sends | spawn entrypoint=claude-vscode → `anthropic-client-platform: claude_code_vscode`, UA `claude-cli/2.1.156 (external, claude-vscode, agent-sdk/0.3.156)` | Byte-for-byte capture in real environment ✓ |
+| **log_event** (claude_launched, etc.) | MCP notification at session start | Registers the `claude-vscode` communication server, sends a log_event notification at session start → child process folds it into `tengu_vscode_<name>` | smoke delivery acked ✓ |
+| **IDE tools** (mcp__ide__*) | sdkMcpServer | in-process MCP server, round-tripped via the control-channel mcp_message | smoke `ide connected` ✓ |
+| **A1** event_logging | spawn failure / abnormal child-process exit | `internal/telemetry` anonymous POST (no auth, x-service-name:claude-code, gated by DISABLE_*) | unit test ✓ |
+| **A2** usage | User views usage | `cc-adapter usage` | Real call to API ✓ |
+| **A3** profile | teleport fetches org | `cc-adapter profile` | unit test ✓ |
+| **A4** oauth refresh | token expires | `internal/auth` auto-refresh (platform.claude.com) | unit test ✓ |
+| **A5** voice WS | Voice input | `cc-adapter voice` (stdin PCM 16k mono) | unit test + fake WS handshake ✓ |
+| **A6** sessions + 3 derived | remote/teleport | `cc-adapter sessions` / `session <id>` / `teleport-events <id>` / `session-ingress <id>` | unit test (incl. pagination aggregation) ✓ |
 
-**UA 指纹**：子进程主流量 UA 带 `claude-vscode`（claude 二进制注入）；cc-adapter 自己发的辅助请求（A1-A6）UA 设 `axios/1.9.0`，匹配真插件 extension 的 axios 客户端（不泄漏 `Go-http-client/1.1`）。
+**UA fingerprint**: the child process's main-traffic UA carries `claude-vscode` (injected by the claude binary); the auxiliary requests cc-adapter sends itself (A1-A6) set their UA to `axios/1.9.0`, matching the genuine extension's axios client (does not leak `Go-http-client/1.1`).
 
-**认证**：读 `~/.claude/.credentials.json`（`claudeAiOauth.accessToken`）+ macOS Keychain `Claude Code-credentials` fallback；`account_uuid` 由 JWT payload `.sub` 解出。
+**Authentication**: reads `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`) + macOS Keychain `Claude Code-credentials` fallback; `account_uuid` is decoded from the JWT payload `.sub`.
 
-## 用法
+## Usage
 
 ```bash
 go build -o cc-adapter .
 export CLAUDE_REAL_BIN=~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude
 
-# 会话（默认 host 模式）
-./cc-adapter "fix the bug"          # 单次 prompt
-./cc-adapter                        # 交互 REPL（stdin 一行一个 turn）
+# Session (default host mode)
+./cc-adapter "fix the bug"          # single prompt
+./cc-adapter                        # interactive REPL (one turn per stdin line)
 
-# 下游 claude -p 兼容面（上游始终是完整 VS Code webview 会话）
-./cc-adapter -p "summarize"                        # -p：打印结果后退出
-echo "summarize this" | ./cc-adapter -p            # 从管道读 prompt
-./cc-adapter -p --output-format json "..."         # json：透出 result 帧（同 claude -p）
-./cc-adapter -p --output-format stream-json "..."  # stream-json：逐帧透出（已过滤控制通道帧）
+# Downstream claude -p compatible surface (upstream is always a full VS Code webview session)
+./cc-adapter -p "summarize"                        # -p: print the result then exit
+echo "summarize this" | ./cc-adapter -p            # read the prompt from the pipe
+./cc-adapter -p --output-format json "..."         # json: forward the result frame (same as claude -p)
+./cc-adapter -p --output-format stream-json "..."  # stream-json: forward frame by frame (control-channel frames already filtered)
 printf '%s\n' '{"type":"user","message":{"content":"hi"}}' | ./cc-adapter -p --input-format stream-json
-./cc-adapter -p --model opus --permission-mode plan "..."  # 任意 claude 会话 flag 原样转发给子进程
+./cc-adapter -p --model opus --permission-mode plan "..."  # any claude session flag is forwarded verbatim to the child process
 
-# 复刻插件功能性请求（需已登录的 OAuth 凭据）
+# Reproduce the extension's functional requests (requires logged-in OAuth credentials)
 ./cc-adapter usage
 ./cc-adapter profile
 ./cc-adapter sessions
 ./cc-adapter session <id>
 ./cc-adapter teleport-events <id>
 ./cc-adapter session-ingress <id>
-./cc-adapter voice                  # 从 stdin 读 PCM linear16/16k/mono
+./cc-adapter voice                  # read PCM linear16/16k/mono from stdin
 ```
 
-真实 claude 二进制解析顺序：`-claude-bin` > `$CLAUDE_REAL_BIN` > `PATH` 上的 `claude`（注意 alias 不影响 `exec.LookPath`，但别把 cc-adapter 本身装成 PATH 的 claude，否则递归）。
+The real claude binary resolution order: `-claude-bin` > `$CLAUDE_REAL_BIN` > `claude` on `PATH` (note that an alias does not affect `exec.LookPath`, but do not install cc-adapter itself as the `claude` on PATH, or it will recurse).
 
-**下游 claude -p flag（adapter 自己接管，不转发给子进程）**：
+**Downstream claude -p flags (the adapter takes these over itself, not forwarded to the child process)**:
 
-| flag | 作用 |
+| flag | Effect |
 |---|---|
-| `-p` / `--print` | 非交互模式：喂入 prompt、打印结果后退出 |
-| `--output-format <text\|json\|stream-json>` | 下游输出格式（默认 text，同 claude -p） |
-| `--input-format <text\|stream-json>` | 下游输入格式：text 整段 stdin 当 prompt；stream-json 逐行解析 user turn |
-| `--include-partial-messages` | 转发给子进程使其吐出增量 stream_event 帧；与 `--output-format stream-json` 配合（实测生效）|
-| `--replay-user-messages` | 转发给子进程使其在 stdout 回显 user 帧供下游确认（实测生效）|
+| `-p` / `--print` | Non-interactive mode: feed in the prompt, print the result, then exit |
+| `--output-format <text\|json\|stream-json>` | Downstream output format (default text, same as claude -p) |
+| `--input-format <text\|stream-json>` | Downstream input format: text treats the whole stdin as the prompt; stream-json parses user turns line by line |
+| `--include-partial-messages` | Forwarded to the child process to make it emit incremental stream_event frames; pairs with `--output-format stream-json` (verified working) |
+| `--replay-user-messages` | Forwarded to the child process to make it echo user frames on stdout for downstream confirmation (verified working) |
 
-其余 claude 会话 flag（`--model`、`--add-dir`、`--allowedTools`、`--system-prompt`、`--permission-mode`、`--resume`、`--session-id`…）**原样转发**给子进程。变参 flag 紧贴位置 prompt 时用 `--` 分隔，例：`cc-adapter -p --allowedTools Bash Edit -- "summarize this"`。
+All other claude session flags (`--model`, `--add-dir`, `--allowedTools`, `--system-prompt`, `--permission-mode`, `--resume`, `--session-id`…) are **forwarded verbatim** to the child process. When a variadic flag is adjacent to the positional prompt, use `--` to separate them, e.g.: `cc-adapter -p --allowedTools Bash Edit -- "summarize this"`.
 
-**adapter 管理 flag（不转发，`-x` / `--x` 两种写法均可）**：
+**Adapter management flags (not forwarded; both `-x` / `--x` spellings are accepted)**:
 
-| flag | 作用 |
+| flag | Effect |
 |---|---|
-| `--no-ide` | 不注册 IDE in-process MCP server |
-| `--no-telemetry` | 关闭 A1 异常遥测 |
-| `--deny-writes` | 拒绝写类工具 |
-| `--claude-bin <path>` | 指定真实 claude 二进制 |
+| `--no-ide` | Do not register the IDE in-process MCP server |
+| `--no-telemetry` | Disable A1 abnormal-exit telemetry |
+| `--deny-writes` | Reject write-class tools |
+| `--claude-bin <path>` | Specify the real claude binary |
 
-## 已验证 vs stub
+## Verified vs Stub
 
-- **已真环境/单测验证**：messages 归因、log_event 投递、IDE server 连接、A2 真调 API、UA 对齐、A6 分页聚合。
-- **stub / 受限**：A5 voice 的音频管线（headless 无音频源，命令入口可从 stdin 读 PCM 或仅验证握手）；A2/A3/A5/A6 在 headless 场景需显式子命令触发（真插件也只在对应用户操作时发）。
+- **Verified in a real environment / by unit test**: messages attribution, log_event delivery, IDE server connection, A2 real API call, UA alignment, A6 pagination aggregation.
+- **Stub / limited**: A5 voice's audio pipeline (headless has no audio source; the command entry point can read PCM from stdin or only verify the handshake); A2/A3/A5/A6 require explicit subcommand triggers in a headless scenario (the genuine extension also only sends them on the corresponding user action).
 
-## 逆向依据
+## Reverse-Engineering Basis
 
-完整逆向笔记见 [reverse-engineering.md](reverse-engineering.md)：进程启动/flag、环境变量、IDE 协议、计费归因（`p2()` → `anthropic-client-platform`）、stream-json 协议、以及插件主动网络互动清单（A1-A6 + log_event）。
+Full reverse-engineering notes are in [reverse-engineering.md](reverse-engineering.md): process startup/flags, environment variables, the IDE protocol, billing attribution (`p2()` → `anthropic-client-platform`), the stream-json protocol, and the list of the extension's active network interactions (A1-A6 + log_event).
