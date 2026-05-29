@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/cc-adapter .
+          tar -C dist -czf "cc-adapter_${GITHUB_REF_NAME}_linux_${GOARCH}.tar.gz" cc-adapter
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "cc-adapter_*_linux_*.tar.gz"
