@@ -10,8 +10,42 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hoveychen/cc-adapter/internal/ide"
 	"github.com/hoveychen/cc-adapter/internal/streamjson"
 )
+
+// runRelay spawns the real claude in relay mode and bridges the downstream SDK
+// (os.Stdin/os.Stdout) to it until claude exits, returning the child's exit
+// code. The Host carries the vscode env/baseline as in every other mode; what
+// differs is that the Host does no decoding and the relay owns all routing. The
+// RawSink closure captures r, which is assigned before Start launches the read
+// goroutine that invokes it.
+func runRelay(ctx context.Context, claudePath string, mcpServer *ide.MCPServer, extra []string, opts cliOpts, logger *log.Logger, emitTelemetry func(string, map[string]any)) int {
+	var r *relay
+	host := streamjson.NewHost(streamjson.Config{
+		ClaudePath:    claudePath,
+		MCPServer:     mcpServer,
+		IDEServerName: "ide",
+		ExtraArgs:     extra,
+		Logger:        logger,
+		RelayMode:     true,
+		RawSink:       func(line []byte) { r.onUpstreamLine(line) },
+	})
+	r = newRelay(host, opts.denyWrites, logger)
+
+	if err := host.Start(ctx); err != nil {
+		logger.Printf("%v", err)
+		emitTelemetry("claude_spawn_failed", map[string]any{"phase": "spawn"})
+		return 1
+	}
+	logger.Printf("relay mode: SDK-driven stream-json bridge (entrypoint=claude-vscode)")
+
+	code := r.run(ctx, os.Stdin)
+	if code != 0 && ctx.Err() == nil {
+		emitTelemetry("claude_subprocess_exited_unexpectedly", map[string]any{"exit_code": code})
+	}
+	return code
+}
 
 // relay bridges the downstream Claude Agent SDK (parent) and the upstream real
 // claude (child) on the stream-json control protocol. cc-adapter spawns claude

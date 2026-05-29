@@ -141,6 +141,15 @@ func run() int {
 		extra = append(extra, "--replay-user-messages")
 	}
 
+	// Relay mode: the downstream caller (the Claude Agent SDK) drives the full
+	// bidirectional control protocol, so cc-adapter behaves as a faithful claude
+	// child rather than the one-shot `claude -p` output emulation. The relay owns
+	// stdin/stdout and bridges both control channels; the print/REPL paths below
+	// are bypassed entirely.
+	if opts.relayMode() {
+		return runRelay(ctx, claudePath, mcpServer, extra, opts, logger, emitTelemetry)
+	}
+
 	perm := func(tool string, _ json.RawMessage) (bool, string) {
 		if opts.denyWrites && isWriteTool(tool) {
 			return false, "writes denied by --deny-writes"
