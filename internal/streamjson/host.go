@@ -126,12 +126,20 @@ func (h *Host) baselineArgs() []string {
 // tools are reached as an in-process sdkMcpServer over the control channel, so
 // no CLAUDE_CODE_SSE_PORT / auto-connect env is needed (that was the
 // terminal-mode WebSocket mechanism).
+//
+// DISABLE_AUTOUPDATER=1 stops the spawned claude from running its background
+// auto-updater (it overrides the autoUpdates config). The real VS Code
+// extension does not set this — the extension manages its own native-binary
+// updates — but it only gates a local update check, so it leaves the
+// billing-attribution / User-Agent fingerprint (which depend solely on
+// CLAUDE_CODE_ENTRYPOINT and request headers) untouched.
 func (h *Host) buildEnv() []string {
 	overrides := map[string]string{
 		"CLAUDE_CODE_ENTRYPOINT":     "claude-vscode",
 		"MCP_CONNECTION_NONBLOCKING": "true",
 		"CLAUDE_CODE_ENABLE_TASKS":   "0",
 		"CLAUDE_AGENT_SDK_VERSION":   "0.3.156",
+		"DISABLE_AUTOUPDATER":        "1",
 	}
 	var env []string
 	seen := make(map[string]bool)
