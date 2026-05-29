@@ -76,6 +76,19 @@ func run() int {
 		}
 	}
 
+	// Version probe: the Claude Agent SDK runs `<cli> -v` (2s timeout) before
+	// opening a session and parses a leading X.Y.Z from stdout. Real claude prints
+	// its version and exits; cc-adapter must do the same or the SDK's preflight
+	// hangs (a bare -v would otherwise be forwarded as a session flag and block on
+	// stdin). Mirror claude by passing the version flag straight through to the
+	// real binary and relaying its output. Matched anywhere in argv, as claude
+	// treats -v/--version as print-version-and-exit.
+	for _, a := range rawArgs {
+		if a == "-v" || a == "--version" {
+			return runVersion(a)
+		}
+	}
+
 	opts := parseArgs(rawArgs)
 
 	logger := log.New(os.Stderr, "[cc-adapter] ", log.LstdFlags)
@@ -124,8 +137,11 @@ func run() int {
 
 	// Session-configuration flags pass through verbatim to the child claude. The
 	// child always runs in webview stream-json mode regardless of the downstream
-	// --output-format/--input-format the caller requested.
-	extra := opts.forward
+	// --output-format/--input-format the caller requested. dedupBaselineFlags
+	// drops any forwarded copy of a flag the Host baseline already supplies (e.g.
+	// the Agent SDK re-passing --verbose / --permission-prompt-tool stdio), so the
+	// child never gets duplicates.
+	extra := dedupBaselineFlags(opts.forward)
 
 	// --include-partial-messages / --replay-user-messages are adapter-owned (we
 	// consume them in parseArgs), but their effect is produced by the child: it
@@ -136,6 +152,15 @@ func run() int {
 	}
 	if opts.replayUserMessages {
 		extra = append(extra, "--replay-user-messages")
+	}
+
+	// Relay mode: the downstream caller (the Claude Agent SDK) drives the full
+	// bidirectional control protocol, so cc-adapter behaves as a faithful claude
+	// child rather than the one-shot `claude -p` output emulation. The relay owns
+	// stdin/stdout and bridges both control channels; the print/REPL paths below
+	// are bypassed entirely.
+	if opts.relayMode() {
+		return runRelay(ctx, claudePath, mcpServer, extra, opts, logger, emitTelemetry)
 	}
 
 	perm := func(tool string, _ json.RawMessage) (bool, string) {
@@ -401,6 +426,30 @@ func runVoice() int {
 
 	if streamErr != nil {
 		fmt.Fprintf(os.Stderr, "cc-adapter voice: %v\n", streamErr)
+		return 1
+	}
+	return 0
+}
+
+// runVersion answers the Agent SDK's `<cli> -v` preflight by passing the version
+// flag straight to the real claude and relaying its stdout/stderr, so the SDK
+// reads an authentic X.Y.Z and proceeds to open the real stream-json session.
+// It resolves the real binary via -claude-bin / $CLAUDE_REAL_BIN / PATH and
+// never starts the stream-json host.
+func runVersion(versionFlag string) int {
+	claudePath, err := resolveClaude("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cc-adapter %s: %v\n", versionFlag, err)
+		return 1
+	}
+	cmd := exec.Command(claudePath, versionFlag)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "cc-adapter %s: %v\n", versionFlag, err)
 		return 1
 	}
 	return 0

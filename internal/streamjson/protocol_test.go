@@ -2,6 +2,7 @@ package streamjson
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -119,5 +120,54 @@ func TestControlResponseWire(t *testing.T) {
 	resp := got["response"].(map[string]any)
 	if resp["subtype"] != "success" || resp["request_id"] != "r1" {
 		t.Errorf("response = %v", resp)
+	}
+}
+
+func TestMergeSDKMcpServers_AppendsAndDedups(t *testing.T) {
+	// SDK declared one server "myserver"; cc-adapter injects ide + claude-vscode.
+	body := json.RawMessage(`{"subtype":"initialize","hooks":{},"sdkMcpServers":["myserver"]}`)
+	out := MergeSDKMcpServers(body, "ide", "claude-vscode")
+
+	var got struct {
+		Subtype       string          `json:"subtype"`
+		Hooks         json.RawMessage `json:"hooks"`
+		SDKMcpServers []string        `json:"sdkMcpServers"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal merged: %v", err)
+	}
+	if got.Subtype != "initialize" {
+		t.Fatalf("subtype = %q", got.Subtype)
+	}
+	if string(got.Hooks) != "{}" {
+		t.Fatalf("hooks not preserved: %s", got.Hooks)
+	}
+	want := []string{"myserver", "ide", "claude-vscode"}
+	if !reflect.DeepEqual(got.SDKMcpServers, want) {
+		t.Fatalf("sdkMcpServers = %v, want %v", got.SDKMcpServers, want)
+	}
+
+	// Idempotent: re-merging the same names adds nothing.
+	out2 := MergeSDKMcpServers(out, "ide", "claude-vscode")
+	json.Unmarshal(out2, &got)
+	if !reflect.DeepEqual(got.SDKMcpServers, want) {
+		t.Fatalf("non-idempotent: %v", got.SDKMcpServers)
+	}
+}
+
+func TestMergeSDKMcpServers_EmptyBody(t *testing.T) {
+	out := MergeSDKMcpServers(nil, "ide", "claude-vscode")
+	var got struct {
+		Subtype       string   `json:"subtype"`
+		SDKMcpServers []string `json:"sdkMcpServers"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Subtype != "initialize" {
+		t.Fatalf("subtype = %q, want initialize", got.Subtype)
+	}
+	if !reflect.DeepEqual(got.SDKMcpServers, []string{"ide", "claude-vscode"}) {
+		t.Fatalf("sdkMcpServers = %v", got.SDKMcpServers)
 	}
 }

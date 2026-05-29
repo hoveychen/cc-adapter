@@ -163,3 +163,63 @@ func TestParseArgs_UnknownFlagForwardedAsBoolean(t *testing.T) {
 		t.Fatalf("prompt = %q", o.prompt())
 	}
 }
+
+// --- SDK-driven relay flag handling (P1) ---
+
+// TestParseArgs_SDKTransportFlags verifies the exact argv the Claude Agent SDK
+// spawns its child with parses cleanly: input/output-format consumed, relay
+// mode detected, --permission-prompt-tool consuming its `stdio` value (not
+// leaking it as a positional prompt), and no stray prompt.
+func TestParseArgs_SDKTransportFlags(t *testing.T) {
+	o := parseArgs([]string{
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--permission-prompt-tool", "stdio",
+		"--print",
+	})
+	if !o.relayMode() {
+		t.Fatalf("relayMode = false, want true")
+	}
+	if o.prompt() != "" {
+		t.Fatalf("prompt = %q, want empty (stdio must not leak as a positional)", o.prompt())
+	}
+	// --verbose and --permission-prompt-tool stdio are forwarded here; the
+	// baseline dedup is what strips them before they reach the child.
+	got := dedupBaselineFlags(o.forward)
+	if len(got) != 0 {
+		t.Fatalf("after dedup, child extra args = %v, want empty", got)
+	}
+}
+
+func TestRelayMode_OnlyWhenBothStreamJSON(t *testing.T) {
+	cases := []struct {
+		in, out string
+		want    bool
+	}{
+		{"stream-json", "stream-json", true},
+		{"stream-json", "text", false},
+		{"text", "stream-json", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		o := cliOpts{inputFormat: c.in, outputFormat: c.out}
+		if got := o.relayMode(); got != c.want {
+			t.Fatalf("relayMode(in=%q,out=%q) = %v, want %v", c.in, c.out, got, c.want)
+		}
+	}
+}
+
+func TestDedupBaselineFlags(t *testing.T) {
+	in := []string{
+		"--permission-prompt-tool", "stdio", // dup of baseline (2 tokens)
+		"--verbose",                  // dup of baseline (1 token)
+		"--model", "claude-opus-4-8", // kept (not baseline)
+		"--add-dir", "/tmp", "/var", // kept
+	}
+	got := dedupBaselineFlags(in)
+	want := []string{"--model", "claude-opus-4-8", "--add-dir", "/tmp", "/var"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dedupBaselineFlags = %v, want %v", got, want)
+	}
+}
