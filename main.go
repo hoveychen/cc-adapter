@@ -7,17 +7,26 @@
 // The IDE JSON-RPC is tunneled over the stream-json control channel's
 // mcp_message frames (not the terminal-mode WebSocket + lockfile + SSE_PORT).
 //
-// Unlike a transparent passthrough wrapper (which inherits whatever mode the
-// user invokes), cc-adapter IS the stream-json host: it owns stdin/stdout,
-// performs the initialize handshake, answers tool-permission requests over the
-// stdio control channel, and renders assistant output. claude never runs in
-// one-shot `-p` mode here; it runs the realtime streaming session VS Code uses.
+// Upstream, claude ALWAYS runs as the realtime VS Code webview stream-json
+// session (never one-shot `-p`): cc-adapter IS the stream-json host, owning the
+// child's stdin/stdout, performing the initialize handshake, answering
+// tool-permission requests over the stdio control channel, and reaching the IDE
+// tools as an in-process MCP server. That is what keeps the upstream traffic
+// indistinguishable from a real VS Code session.
+//
+// Downstream, cc-adapter presents a `claude -p`-compatible surface: it accepts
+// -p, the full set of claude session flags (forwarded verbatim to the child),
+// pipes, and --input-format / --output-format, then re-presents the child's
+// stream-json frames to the caller in the requested format. The mismatch is the
+// point — a cheap `claude -p` front bridged onto a full VS Code session.
 //
 // Usage:
 //
-//	cc-adapter "fix the bug in main.go"     # one-shot prompt, prints result, exits
-//	cc-adapter                              # interactive REPL (one stdin line per turn)
-//	cc-adapter -model claude-opus-4-8 ...   # pass flags through to claude
+//	cc-adapter "fix the bug in main.go"               # one-shot prompt, prints result, exits
+//	cc-adapter                                        # interactive REPL (one stdin line per turn)
+//	cc-adapter -p "summarize" --model claude-opus-4-8 # claude -p surface; --model forwarded to child
+//	echo "summarize this" | cc-adapter -p             # prompt from a pipe
+//	cc-adapter -p --output-format json "..."          # json / stream-json output like claude -p
 package main
 
 import (

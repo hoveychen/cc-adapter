@@ -20,11 +20,15 @@ cc-adapter (Go)
 └── internal/voice/          A5 voice_stream WebSocket 客户端
 ```
 
-子进程以 VS Code 默认 **webview 模式**的方式拉起（不是 `claude -p`）：
+**双边设计**：上游（真 claude + Anthropic 后台）永远看到一个完整 VS Code webview 会话；下游（调用方）看到一个 `claude -p` 兼容接口。两边的不匹配正是 adapter 的价值——把廉价的 `claude -p` 用法桥接到完整 VS Code 会话上。
+
+子进程**恒**以 VS Code 默认 **webview 模式**拉起（无论下游传什么，都不是 `claude -p`）：
 ```
 claude --output-format stream-json --input-format stream-json --verbose --permission-prompt-tool stdio
 ```
 注入 env：`CLAUDE_CODE_ENTRYPOINT=claude-vscode`（计费归因核心）、`MCP_CONNECTION_NONBLOCKING=true`、`CLAUDE_CODE_ENABLE_TASKS=0`、`CLAUDE_AGENT_SDK_VERSION=0.3.156`，删除 `NODE_OPTIONS`。
+
+下游的 `-p` / `--output-format` / `--input-format` 只决定 adapter 怎么跟**调用方**说话：adapter 通过 host 的 RawSink 把子进程的 stream-json 帧重新呈现给下游——`text` 打最终 result 文本，`json` 透出 result 帧，`stream-json` 逐帧透出（过滤掉 control 通道帧，使之与真 `claude -p` 一致）。除 I/O 类与管理类 flag 外，其余 claude 会话 flag（`--model`、`--add-dir`、`--system-prompt`、`--permission-mode` 等）原样转发给子进程，无需逐个白名单。
 
 ## 流量指纹对照（cc-adapter vs 真插件）
 
@@ -53,7 +57,14 @@ export CLAUDE_REAL_BIN=~/.vscode/extensions/anthropic.claude-code-*/resources/na
 # 会话（默认 host 模式）
 ./cc-adapter "fix the bug"          # 单次 prompt
 ./cc-adapter                        # 交互 REPL（stdin 一行一个 turn）
-./cc-adapter -model claude-opus-4-8 "..."
+
+# 下游 claude -p 兼容面（上游始终是完整 VS Code webview 会话）
+./cc-adapter -p "summarize"                        # -p：打印结果后退出
+echo "summarize this" | ./cc-adapter -p            # 从管道读 prompt
+./cc-adapter -p --output-format json "..."         # json：透出 result 帧（同 claude -p）
+./cc-adapter -p --output-format stream-json "..."  # stream-json：逐帧透出（已过滤控制通道帧）
+printf '%s\n' '{"type":"user","message":{"content":"hi"}}' | ./cc-adapter -p --input-format stream-json
+./cc-adapter -p --model opus --permission-mode plan "..."  # 任意 claude 会话 flag 原样转发给子进程
 
 # 复刻插件功能性请求（需已登录的 OAuth 凭据）
 ./cc-adapter usage
@@ -67,13 +78,25 @@ export CLAUDE_REAL_BIN=~/.vscode/extensions/anthropic.claude-code-*/resources/na
 
 真实 claude 二进制解析顺序：`-claude-bin` > `$CLAUDE_REAL_BIN` > `PATH` 上的 `claude`（注意 alias 不影响 `exec.LookPath`，但别把 cc-adapter 本身装成 PATH 的 claude，否则递归）。
 
+**下游 claude -p flag（adapter 自己接管，不转发给子进程）**：
+
 | flag | 作用 |
 |---|---|
-| `-model <m>` | 透传 `--model` |
-| `-no-ide` | 不注册 IDE in-process MCP server |
-| `-no-telemetry` | 关闭 A1 异常遥测 |
-| `-deny-writes` | 拒绝写类工具 |
-| `-claude-bin <path>` | 指定真实 claude 二进制 |
+| `-p` / `--print` | 非交互模式：喂入 prompt、打印结果后退出 |
+| `--output-format <text\|json\|stream-json>` | 下游输出格式（默认 text，同 claude -p） |
+| `--input-format <text\|stream-json>` | 下游输入格式：text 整段 stdin 当 prompt；stream-json 逐行解析 user turn |
+| `--include-partial-messages` / `--replay-user-messages` | 已识别为 adapter-owned（占位，行为后续对齐） |
+
+其余 claude 会话 flag（`--model`、`--add-dir`、`--allowedTools`、`--system-prompt`、`--permission-mode`、`--resume`、`--session-id`…）**原样转发**给子进程。
+
+**adapter 管理 flag（不转发，`-x` / `--x` 两种写法均可）**：
+
+| flag | 作用 |
+|---|---|
+| `--no-ide` | 不注册 IDE in-process MCP server |
+| `--no-telemetry` | 关闭 A1 异常遥测 |
+| `--deny-writes` | 拒绝写类工具 |
+| `--claude-bin <path>` | 指定真实 claude 二进制 |
 
 ## 已验证 vs stub
 
