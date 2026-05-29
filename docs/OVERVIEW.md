@@ -1,0 +1,85 @@
+# cc-adapter 总览（架构 / 流量指纹 / 用法）
+
+## 它是什么
+
+`cc-adapter` 是一个 Go 程序，把真实的 `claude` 二进制当 stream-json 子进程驱动，并**完整复刻 VS Code「Claude Code」扩展（v2.1.156）对 Anthropic 发起的全部网络互动**。目标：从 Anthropic 后台看，cc-adapter 产生的流量指纹 = 100% 真 VS Code 插件。
+
+真插件 = **extension 进程**（自己发的遥测/功能请求）+ **spawn 的 claude 子进程**（messages + tengu 遥测）。cc-adapter 把两半都复刻。
+
+## 架构
+
+```
+cc-adapter (Go)
+├── main.go                  入口：host 模式 + 子命令分流
+├── internal/streamjson/     stream-json host：spawn claude、读写循环、control 通道
+│                            （mcp_message 隧道 + log_event 主动下发）
+├── internal/ide/            IDE 工具 MCP server（12 工具）+ CommServer（claude-vscode 通信 server）
+├── internal/auth/           OAuth：读 credentials/keychain、JWT 解 account_uuid、token 刷新(A4)
+├── internal/telemetry/      A1 event_logging 匿名遥测（ClaudeCodeInternalEvent）
+├── internal/cloud/          A2 usage / A3 profile / A6 sessions(+3衍生端点) oauth GET
+└── internal/voice/          A5 voice_stream WebSocket 客户端
+```
+
+子进程以 VS Code 默认 **webview 模式**的方式拉起（不是 `claude -p`）：
+```
+claude --output-format stream-json --input-format stream-json --verbose --permission-prompt-tool stdio
+```
+注入 env：`CLAUDE_CODE_ENTRYPOINT=claude-vscode`（计费归因核心）、`MCP_CONNECTION_NONBLOCKING=true`、`CLAUDE_CODE_ENABLE_TASKS=0`、`CLAUDE_AGENT_SDK_VERSION=0.3.156`，删除 `NODE_OPTIONS`。
+
+## 流量指纹对照（cc-adapter vs 真插件）
+
+| 请求 | 真插件触发 | cc-adapter 复刻 | 验证 |
+|---|---|---|---|
+| **messages + tengu 遥测** | 子进程恒发 | spawn entrypoint=claude-vscode → `anthropic-client-platform: claude_code_vscode`、UA `claude-cli/2.1.156 (external, claude-vscode, agent-sdk/0.3.156)` | 真环境抓包逐字 ✓ |
+| **log_event**（claude_launched 等） | 会话启动 MCP 通知 | 注册 `claude-vscode` 通信 server，会话启动发 log_event notification → 子进程折成 `tengu_vscode_<name>` | smoke 投递 acked ✓ |
+| **IDE 工具**（mcp__ide__*） | sdkMcpServer | in-process MCP server，经 control 通道 mcp_message 往返 | smoke `ide connected` ✓ |
+| **A1** event_logging | spawn 失败/子进程异常退出 | `internal/telemetry` 匿名 POST（无 auth，x-service-name:claude-code，gate DISABLE_*） | 单测 ✓ |
+| **A2** usage | 用户看用量 | `cc-adapter usage` | 真调到 API ✓ |
+| **A3** profile | teleport 取 org | `cc-adapter profile` | 单测 ✓ |
+| **A4** oauth refresh | token 过期 | `internal/auth` 自动刷新（platform.claude.com） | 单测 ✓ |
+| **A5** voice WS | 语音输入 | `cc-adapter voice`（stdin PCM 16k mono） | 单测+假WS握手 ✓ |
+| **A6** sessions + 3 衍生 | remote/teleport | `cc-adapter sessions` / `session <id>` / `teleport-events <id>` / `session-ingress <id>` | 单测（含分页聚合）✓ |
+
+**UA 指纹**：子进程主流量 UA 带 `claude-vscode`（claude 二进制注入）；cc-adapter 自己发的辅助请求（A1-A6）UA 设 `axios/1.9.0`，匹配真插件 extension 的 axios 客户端（不泄漏 `Go-http-client/1.1`）。
+
+**认证**：读 `~/.claude/.credentials.json`（`claudeAiOauth.accessToken`）+ macOS Keychain `Claude Code-credentials` fallback；`account_uuid` 由 JWT payload `.sub` 解出。
+
+## 用法
+
+```bash
+go build -o cc-adapter .
+export CLAUDE_REAL_BIN=~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude
+
+# 会话（默认 host 模式）
+./cc-adapter "fix the bug"          # 单次 prompt
+./cc-adapter                        # 交互 REPL（stdin 一行一个 turn）
+./cc-adapter -model claude-opus-4-8 "..."
+
+# 复刻插件功能性请求（需已登录的 OAuth 凭据）
+./cc-adapter usage
+./cc-adapter profile
+./cc-adapter sessions
+./cc-adapter session <id>
+./cc-adapter teleport-events <id>
+./cc-adapter session-ingress <id>
+./cc-adapter voice                  # 从 stdin 读 PCM linear16/16k/mono
+```
+
+真实 claude 二进制解析顺序：`-claude-bin` > `$CLAUDE_REAL_BIN` > `PATH` 上的 `claude`（注意 alias 不影响 `exec.LookPath`，但别把 cc-adapter 本身装成 PATH 的 claude，否则递归）。
+
+| flag | 作用 |
+|---|---|
+| `-model <m>` | 透传 `--model` |
+| `-no-ide` | 不注册 IDE in-process MCP server |
+| `-no-telemetry` | 关闭 A1 异常遥测 |
+| `-deny-writes` | 拒绝写类工具 |
+| `-claude-bin <path>` | 指定真实 claude 二进制 |
+
+## 已验证 vs stub
+
+- **已真环境/单测验证**：messages 归因、log_event 投递、IDE server 连接、A2 真调 API、UA 对齐、A6 分页聚合。
+- **stub / 受限**：A5 voice 的音频管线（headless 无音频源，命令入口可从 stdin 读 PCM 或仅验证握手）；A2/A3/A5/A6 在 headless 场景需显式子命令触发（真插件也只在对应用户操作时发）。
+
+## 逆向依据
+
+完整逆向笔记见 [reverse-engineering.md](reverse-engineering.md)：进程启动/flag、环境变量、IDE 协议、计费归因（`p2()` → `anthropic-client-platform`）、stream-json 协议、以及插件主动网络互动清单（A1-A6 + log_event）。
