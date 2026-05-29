@@ -7,24 +7,32 @@
 // The IDE JSON-RPC is tunneled over the stream-json control channel's
 // mcp_message frames (not the terminal-mode WebSocket + lockfile + SSE_PORT).
 //
-// Unlike a transparent passthrough wrapper (which inherits whatever mode the
-// user invokes), cc-adapter IS the stream-json host: it owns stdin/stdout,
-// performs the initialize handshake, answers tool-permission requests over the
-// stdio control channel, and renders assistant output. claude never runs in
-// one-shot `-p` mode here; it runs the realtime streaming session VS Code uses.
+// Upstream, claude ALWAYS runs as the realtime VS Code webview stream-json
+// session (never one-shot `-p`): cc-adapter IS the stream-json host, owning the
+// child's stdin/stdout, performing the initialize handshake, answering
+// tool-permission requests over the stdio control channel, and reaching the IDE
+// tools as an in-process MCP server. That is what keeps the upstream traffic
+// indistinguishable from a real VS Code session.
+//
+// Downstream, cc-adapter presents a `claude -p`-compatible surface: it accepts
+// -p, the full set of claude session flags (forwarded verbatim to the child),
+// pipes, and --input-format / --output-format, then re-presents the child's
+// stream-json frames to the caller in the requested format. The mismatch is the
+// point — a cheap `claude -p` front bridged onto a full VS Code session.
 //
 // Usage:
 //
-//	cc-adapter "fix the bug in main.go"     # one-shot prompt, prints result, exits
-//	cc-adapter                              # interactive REPL (one stdin line per turn)
-//	cc-adapter -model claude-opus-4-8 ...   # pass flags through to claude
+//	cc-adapter "fix the bug in main.go"               # one-shot prompt, prints result, exits
+//	cc-adapter                                        # interactive REPL (one stdin line per turn)
+//	cc-adapter -p "summarize" --model claude-opus-4-8 # claude -p surface; --model forwarded to child
+//	echo "summarize this" | cc-adapter -p             # prompt from a pipe
+//	cc-adapter -p --output-format json "..."          # json / stream-json output like claude -p
 package main
 
 import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -51,33 +59,24 @@ func main() {
 }
 
 func run() int {
-	var (
-		model       = flag.String("model", "", "pass --model to claude")
-		noIDE       = flag.Bool("no-ide", false, "do not register the IDE in-process MCP server (billing attribution still applies)")
-		denyWrites  = flag.Bool("deny-writes", false, "deny write-class tools (Write/Edit/MultiEdit/NotebookEdit/Bash)")
-		claudeBin   = flag.String("claude-bin", "", "path to the real claude binary (else $CLAUDE_REAL_BIN, else PATH)")
-		noTelemetry = flag.Bool("no-telemetry", false, "disable the anonymous internal-event telemetry the VS Code extension sends on spawn/exit failures")
-	)
-	flag.Parse()
-	args := flag.Args()
+	rawArgs := os.Args[1:]
 
-	// Subcommand dispatch: when the first positional argument is exactly one of
-	// the cloud subcommands, hit the corresponding OAuth-authenticated endpoint,
-	// print its result, and exit without starting the stream-json host. Any other
-	// first argument (including none, a plain prompt, or flags) falls through to
-	// the unchanged host path.
-	if len(args) > 0 {
-		switch args[0] {
+	// Subcommand dispatch: when the first token is exactly one of the cloud
+	// subcommands, hit the corresponding OAuth-authenticated endpoint, print its
+	// result, and exit without starting the stream-json host. Any other first
+	// token (a flag, a plain prompt, or none) falls through to the host path.
+	if len(rawArgs) > 0 {
+		switch rawArgs[0] {
 		case "usage", "profile", "sessions":
-			return runCloud(args[0])
+			return runCloud(rawArgs[0])
 		case "session", "teleport-events", "session-ingress":
-			return runCloudWithID(args[0], args[1:])
+			return runCloudWithID(rawArgs[0], rawArgs[1:])
 		case "voice":
 			return runVoice()
 		}
 	}
 
-	prompt := strings.Join(args, " ")
+	opts := parseArgs(rawArgs)
 
 	logger := log.New(os.Stderr, "[cc-adapter] ", log.LstdFlags)
 	telemetry.SetLogger(logger)
@@ -88,17 +87,17 @@ func run() int {
 	// hot path.
 	accountUUID := resolveAccountUUID()
 
-	// emitTelemetry posts an internal event unless disabled by -no-telemetry.
+	// emitTelemetry posts an internal event unless disabled by --no-telemetry.
 	// The package itself also honours CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC /
 	// DISABLE_TELEMETRY / DO_NOT_TRACK.
 	emitTelemetry := func(name string, data map[string]any) {
-		if *noTelemetry {
+		if opts.noTelemetry {
 			return
 		}
 		telemetry.PostInternalEvent(name, data, accountUUID)
 	}
 
-	claudePath, err := resolveClaude(*claudeBin)
+	claudePath, err := resolveClaude(opts.claudeBin)
 	if err != nil {
 		logger.Printf("%v", err)
 		return 1
@@ -117,40 +116,64 @@ func run() int {
 	// tunneling JSON-RPC over the stream-json control channel's mcp_message
 	// frames (the default-webview-mode path).
 	var mcpServer *ide.MCPServer
-	if !*noIDE {
+	if !opts.noIDE {
 		provider := ide.NewHeadlessProvider(workspaceFolders)
 		mcpServer = ide.NewMCPServer(provider, logger)
 		logger.Printf("IDE in-process MCP server enabled (server name: ide)")
 	}
 
-	var extra []string
-	if *model != "" {
-		extra = append(extra, "--model", *model)
+	// Session-configuration flags pass through verbatim to the child claude. The
+	// child always runs in webview stream-json mode regardless of the downstream
+	// --output-format/--input-format the caller requested.
+	extra := opts.forward
+
+	// --include-partial-messages / --replay-user-messages are adapter-owned (we
+	// consume them in parseArgs), but their effect is produced by the child: it
+	// emits the extra stream_event / replayed-user frames, which the stream-json
+	// sink then forwards downstream. So re-add them to the child's args when set.
+	if opts.includePartial {
+		extra = append(extra, "--include-partial-messages")
+	}
+	if opts.replayUserMessages {
+		extra = append(extra, "--replay-user-messages")
 	}
 
 	perm := func(tool string, _ json.RawMessage) (bool, string) {
-		if *denyWrites && isWriteTool(tool) {
+		if opts.denyWrites && isWriteTool(tool) {
 			return false, "writes denied by --deny-writes"
 		}
 		return true, ""
 	}
 
-	host := streamjson.NewHost(streamjson.Config{
+	// Mode: interactive REPL only when no -p, no positional prompt, and stdin is
+	// a TTY. Otherwise (-p, a prompt, or a pipe/redirect) we run the
+	// non-interactive print path that mirrors `claude -p`. The print path owns a
+	// RawSink so it can forward/capture the child's stream-json frames verbatim.
+	interactive := !opts.print && opts.prompt() == "" && isTerminal(os.Stdin)
+	var ps *printState
+	cfg := streamjson.Config{
 		ClaudePath:    claudePath,
 		MCPServer:     mcpServer,
 		IDEServerName: "ide",
 		ExtraArgs:     extra,
 		Permission:    perm,
 		Logger:        logger,
-	})
+	}
+	if !interactive {
+		ps = newPrintState(opts.outputFormat)
+		cfg.RawSink = ps.sink
+	}
+
+	host := streamjson.NewHost(cfg)
 	if err := host.Start(ctx); err != nil {
 		logger.Printf("%v", err)
 		emitTelemetry("claude_spawn_failed", map[string]any{"phase": "spawn"})
 		return 1
 	}
 
-	// Drain events: print assistant text to stdout, everything else to stderr.
-	// A nil on turnDone means the stream closed (claude exited).
+	// Drain events. In interactive mode assistant text streams to stdout as it
+	// arrives; in the print path the runPrint driver owns stdout, so the event
+	// loop only routes results and diagnostics.
 	turnDone := make(chan *streamjson.ResultMessage, 1)
 	var launchedOnce sync.Once
 	go func() {
@@ -177,7 +200,9 @@ func run() int {
 					}()
 				})
 			case streamjson.EventAssistantText:
-				fmt.Println(ev.Text)
+				if interactive {
+					fmt.Println(ev.Text)
+				}
 			case streamjson.EventToolUse:
 				logger.Printf("[tool] %s %s", ev.ToolName, string(ev.ToolInput))
 			case streamjson.EventResult:
@@ -199,15 +224,14 @@ func run() int {
 		logger.Printf("initialize: %v", err)
 	}
 
-	if prompt != "" {
-		if err := host.SendUserText(prompt); err != nil {
-			logger.Printf("send: %v", err)
+	if interactive {
+		runREPL(host, turnDone, logger)
+	} else {
+		if err := runPrint(host, opts, ps, turnDone, logger); err != nil {
+			logger.Printf("print: %v", err)
+			_ = host.CloseInput()
 			return 1
 		}
-		<-turnDone
-		_ = host.CloseInput()
-	} else {
-		runREPL(host, turnDone, logger)
 	}
 
 	code := host.Wait()
