@@ -85,9 +85,10 @@ printf '%s\n' '{"type":"user","message":{"content":"hi"}}' | ./cc-adapter -p --i
 | `-p` / `--print` | 非交互模式：喂入 prompt、打印结果后退出 |
 | `--output-format <text\|json\|stream-json>` | 下游输出格式（默认 text，同 claude -p） |
 | `--input-format <text\|stream-json>` | 下游输入格式：text 整段 stdin 当 prompt；stream-json 逐行解析 user turn |
-| `--include-partial-messages` / `--replay-user-messages` | 已识别为 adapter-owned（占位，行为后续对齐） |
+| `--include-partial-messages` | 转发给子进程使其吐出增量 stream_event 帧；与 `--output-format stream-json` 配合（实测生效）|
+| `--replay-user-messages` | 转发给子进程使其在 stdout 回显 user 帧供下游确认（实测生效）|
 
-其余 claude 会话 flag（`--model`、`--add-dir`、`--allowedTools`、`--system-prompt`、`--permission-mode`、`--resume`、`--session-id`…）**原样转发**给子进程。
+其余 claude 会话 flag（`--model`、`--add-dir`、`--allowedTools`、`--system-prompt`、`--permission-mode`、`--resume`、`--session-id`…）**原样转发**给子进程。变参 flag 紧贴位置 prompt 时用 `--` 分隔，例：`cc-adapter -p --allowedTools Bash Edit -- "summarize this"`。
 
 **adapter 管理 flag（不转发，`-x` / `--x` 两种写法均可）**：
 

@@ -92,6 +92,15 @@ func parseArgs(args []string) cliOpts {
 	for i < len(args) {
 		a := args[i]
 
+		// End-of-options separator: everything after a bare "--" is the prompt.
+		// This is the unambiguous escape hatch for the case where a variadic flag
+		// (e.g. --allowedTools) would otherwise swallow the trailing positional
+		// prompt: `cc-adapter -p --allowedTools Bash Edit -- "do the thing"`.
+		if a == "--" {
+			o.promptParts = append(o.promptParts, args[i+1:]...)
+			break
+		}
+
 		// Adapter management flags (both -x and --x spellings).
 		if k := managementKey(a); k != "" {
 			switch k {

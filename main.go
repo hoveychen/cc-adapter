@@ -127,6 +127,17 @@ func run() int {
 	// --output-format/--input-format the caller requested.
 	extra := opts.forward
 
+	// --include-partial-messages / --replay-user-messages are adapter-owned (we
+	// consume them in parseArgs), but their effect is produced by the child: it
+	// emits the extra stream_event / replayed-user frames, which the stream-json
+	// sink then forwards downstream. So re-add them to the child's args when set.
+	if opts.includePartial {
+		extra = append(extra, "--include-partial-messages")
+	}
+	if opts.replayUserMessages {
+		extra = append(extra, "--replay-user-messages")
+	}
+
 	perm := func(tool string, _ json.RawMessage) (bool, string) {
 		if opts.denyWrites && isWriteTool(tool) {
 			return false, "writes denied by --deny-writes"

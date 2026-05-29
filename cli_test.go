@@ -117,6 +117,42 @@ func TestParseArgs_ClaudeBinEquals(t *testing.T) {
 	}
 }
 
+func TestParseArgs_DashDashSeparatesPrompt(t *testing.T) {
+	// The "--" escape hatch: a variadic flag no longer swallows the prompt.
+	o := parseArgs([]string{"-p", "--allowedTools", "Bash", "Edit", "--", "summarize", "this"})
+	wantFwd := []string{"--allowedTools", "Bash", "Edit"}
+	if !reflect.DeepEqual(o.forward, wantFwd) {
+		t.Fatalf("forward = %v, want %v", o.forward, wantFwd)
+	}
+	if o.prompt() != "summarize this" {
+		t.Fatalf("prompt = %q, want %q", o.prompt(), "summarize this")
+	}
+}
+
+func TestParseArgs_DashDashPreservesFlagLikePrompt(t *testing.T) {
+	// After "--", tokens that look like flags are still part of the prompt.
+	o := parseArgs([]string{"-p", "--", "explain", "--verbose", "mode"})
+	if o.prompt() != "explain --verbose mode" {
+		t.Fatalf("prompt = %q", o.prompt())
+	}
+	if len(o.forward) != 0 {
+		t.Fatalf("forward should be empty, got %v", o.forward)
+	}
+}
+
+func TestParseArgs_PartialAndReplay(t *testing.T) {
+	o := parseArgs([]string{"-p", "--include-partial-messages", "--replay-user-messages", "go"})
+	if !o.includePartial || !o.replayUserMessages {
+		t.Fatalf("includePartial=%v replayUserMessages=%v", o.includePartial, o.replayUserMessages)
+	}
+	if len(o.forward) != 0 {
+		t.Fatalf("adapter-owned flags must not be forwarded by the parser, got %v", o.forward)
+	}
+	if o.prompt() != "go" {
+		t.Fatalf("prompt = %q", o.prompt())
+	}
+}
+
 func TestParseArgs_UnknownFlagForwardedAsBoolean(t *testing.T) {
 	o := parseArgs([]string{"-p", "--dangerously-skip-permissions", "go"})
 	wantFwd := []string{"--dangerously-skip-permissions"}
