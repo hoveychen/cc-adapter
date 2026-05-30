@@ -11,3 +11,4 @@
 # Agent scratch (not version-controlled)
 /TASKS.md
 /.worktrees/
+/genclaudeflags
