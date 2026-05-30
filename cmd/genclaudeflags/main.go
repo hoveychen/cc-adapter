@@ -127,23 +127,39 @@ type helpOption struct {
 
 var (
 	// signature column is separated from the description by 2+ spaces; commander
-	// never puts 2+ consecutive spaces inside a signature.
-	reHelpLine = regexp.MustCompile(`^\s+(--?[A-Za-z][^\n]*?)(?:\s{2,}.*)?$`)
+	// never puts 2+ consecutive spaces inside a signature. Group 1 captures the
+	// leading indent, which is how we tell an option entry from a wrapped line.
+	reHelpLine = regexp.MustCompile(`^(\s*)(--?[A-Za-z][^\n]*?)(?:\s{2,}.*)?$`)
 	reMetavar  = regexp.MustCompile(`(<[^>]+>|\[[^\]]+\])\s*$`)
 )
 
+// parseHelpOptions extracts option signatures from `claude --help`. It is
+// indentation-aware because newer claude versions (e.g. 2.1.156) render help at
+// a fixed narrow width — ignoring COLUMNS — so long descriptions wrap onto
+// continuation lines indented to the description column. Two structural facts
+// disambiguate, and both are keyed on indentation rather than on the trimmed
+// text (which loses exactly the signal we need):
+//
+//   - Section headers ("Options:", "Commands:", "Arguments:") sit at column 0.
+//     A deeply-indented wrapped description that happens to end in ":" (e.g.
+//     "...(choices:") is NOT a section boundary — only an unindented colon line
+//     ends the options block.
+//   - Option entries sit at a shallow, constant indent (commander uses 2).
+//     Wrapped descriptions sit at the deeper description column. A line whose
+//     indent exceeds the established option indent is a continuation, even when
+//     it begins with a "--flag" token (e.g. "--settings, --agents, ...") — so
+//     it must never be parsed as a fresh boolean option.
 func parseHelpOptions(help string) []helpOption {
 	var opts []helpOption
 	inOptions := false
+	optionIndent := -1 // indent of option entries; set from the first one seen
 	for _, line := range strings.Split(help, "\n") {
+		leadingWS := len(line) - len(strings.TrimLeft(line, " \t"))
 		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == "Options:":
-			inOptions = true
-			continue
-		case strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(trimmed, "-"):
-			// "Commands:", "Arguments:", etc. end the options block.
-			inOptions = false
+		// Section headers live at column 0. Indented colon-terminated lines are
+		// wrapped description text, not boundaries.
+		if leadingWS == 0 && strings.HasSuffix(trimmed, ":") && !strings.HasPrefix(trimmed, "-") {
+			inOptions = trimmed == "Options:"
 			continue
 		}
 		if !inOptions {
@@ -151,9 +167,16 @@ func parseHelpOptions(help string) []helpOption {
 		}
 		m := reHelpLine.FindStringSubmatch(line)
 		if m == nil {
-			continue // wrapped description continuation
+			continue // wrapped description continuation (no leading flag token)
 		}
-		sig := strings.TrimSpace(m[1])
+		indent := len(m[1])
+		if optionIndent < 0 {
+			optionIndent = indent // first option entry establishes the column
+		}
+		if indent > optionIndent {
+			continue // deeper than an option entry => wrapped description line
+		}
+		sig := strings.TrimSpace(m[2])
 		kind := arityBoolean
 		if mv := reMetavar.FindString(sig); mv != "" {
 			kind = arityFromMetavar(strings.TrimSpace(mv))
