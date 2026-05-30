@@ -90,9 +90,9 @@ Permissions default to allow-all (headless automation with no human to prompt); 
 
 To stay a faithful `claude` stand-in, cc-adapter must split the positional prompt from flag values *exactly* as the real claude does — which means knowing each flag's arity (how many tokens it consumes). claude has many value-taking flags hidden from `--help` (`--thinking`, `--max-turns`, `--system-prompt-file`, …), so the arity table is **not** hand-maintained: it is generated from one specific claude version's own argument parser, and each release is pinned to that version.
 
-- A cc-adapter release `vX.Y.Z` targets **claude CLI `X.Y.Z`** (e.g. `v2.1.141` mirrors claude `2.1.141`). Run matching versions.
+- A cc-adapter release `vX.Y.Z` targets **claude CLI `X.Y.Z`** (e.g. `v2.1.141` mirrors claude `2.1.141`). When a newer claude has the same flag arity as the pinned table, that release tags the same commit, so `PinnedClaudeVersion` may legitimately trail the release tag.
 - [`flags_gen.go`](flags_gen.go) holds the generated arity tables and `PinnedClaudeVersion`. It is produced by [`cmd/genclaudeflags`](cmd/genclaudeflags/main.go), which reads documented flags from `claude --help` and discovers/classifies the hidden ones by probing `claude -p --flag` — zero guessing, the source of truth is claude's own parser.
-- At startup cc-adapter compares the running `claude --version` against `PinnedClaudeVersion` and prints a non-fatal warning on mismatch (regenerate, don't ignore).
+- The [`pin-claude-flags`](.github/workflows/pin-claude-flags.yml) workflow runs daily: it tracks the latest claude release, regenerates the table, and either commits the new table (when arity changed) or just tags the current commit (when only the version differs).
 
 Regenerate when bumping the pinned claude:
 
