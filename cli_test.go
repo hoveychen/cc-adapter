@@ -250,3 +250,44 @@ func TestParseArgs_ThinkingAndMaxTurnsForwarded(t *testing.T) {
 		}
 	}
 }
+
+// TestParseArgs_PluginDirSingleValue guards against the inverse arity bug: claude
+// defines --plugin-dir <path> / --plugin-url <url> as single-value (repeatable),
+// NOT variadic. If they are misclassified as variadic, the flag over-consumes and
+// swallows the trailing positional prompt, leaving the child with no prompt.
+func TestParseArgs_PluginDirSingleValue(t *testing.T) {
+	o := parseArgs([]string{"-p", "--plugin-dir", "/some/dir", "the prompt"})
+	if got := o.prompt(); got != "the prompt" {
+		t.Fatalf("prompt = %q, want %q (--plugin-dir must consume only its single value, not swallow the positional)", got, "the prompt")
+	}
+	wantFwd := []string{"--plugin-dir", "/some/dir"}
+	if !reflect.DeepEqual(o.forward, wantFwd) {
+		t.Fatalf("forward = %v, want %v", o.forward, wantFwd)
+	}
+}
+
+// TestParseArgs_HiddenValueFlagsForwarded covers value-taking flags that claude
+// hides from `--help` but still accepts at the top level. The generated table is
+// built from claude's own parser so these are classified as single-value; if the
+// table regressed to omitting them, each would be treated as boolean and its value
+// token would leak into the positional prompt.
+func TestParseArgs_HiddenValueFlagsForwarded(t *testing.T) {
+	o := parseArgs([]string{
+		"-p",
+		"--max-thinking-tokens", "8000",
+		"--system-prompt-file", "/tmp/sys.txt",
+		"--append-system-prompt-file", "/tmp/extra.txt",
+		"do the work",
+	})
+	if got := o.prompt(); got != "do the work" {
+		t.Fatalf("prompt = %q, want %q (a hidden flag's value leaked into the positional)", got, "do the work")
+	}
+	wantFwd := []string{
+		"--max-thinking-tokens", "8000",
+		"--system-prompt-file", "/tmp/sys.txt",
+		"--append-system-prompt-file", "/tmp/extra.txt",
+	}
+	if !reflect.DeepEqual(o.forward, wantFwd) {
+		t.Fatalf("forward = %v, want %v", o.forward, wantFwd)
+	}
+}

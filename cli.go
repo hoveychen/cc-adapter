@@ -79,39 +79,17 @@ func dedupBaselineFlags(forward []string) []string {
 
 // Flag arity tables for forwarded claude flags. We don't validate which flags
 // exist; we only need to know how many tokens each consumes so the positional
-// prompt is separated from flag values correctly. Unknown leading-dash tokens
-// are treated as boolean (forward the flag alone) — a future value-taking flag
-// would need a one-line addition here, but boolean flags align automatically.
-var (
-	// Single-value: consume exactly the next token as the flag's value.
-	forwardSingleValue = map[string]bool{
-		"--agent": true, "--agents": true, "--append-system-prompt": true,
-		"--system-prompt": true, "--debug-file": true, "--effort": true,
-		"--fallback-model": true, "--json-schema": true, "--max-budget-usd": true,
-		"--max-turns": true,
-		"--model":     true, "--name": true, "-n": true, "--permission-mode": true,
-		"--permission-prompt-tool": true,
-		"--remote-control-session-name-prefix": true, "--session-id": true,
-		"--setting-sources": true, "--settings": true,
-		// --thinking <mode> / --thinking-display <display> are the thinking-token
-		// counter flags the claw-workspace sidecar passes for main-task dispatch.
-		// Both take a value; without them here the value token leaks into the
-		// positional prompt and the child sees a bare `--thinking --thinking-display`.
-		"--thinking": true, "--thinking-display": true,
-	}
-	// Variadic: consume following tokens until the next leading-dash token.
-	forwardVariadic = map[string]bool{
-		"--add-dir": true, "--allowedTools": true, "--allowed-tools": true,
-		"--betas": true, "--disallowedTools": true, "--disallowed-tools": true,
-		"--file": true, "--mcp-config": true, "--plugin-dir": true,
-		"--plugin-url": true, "--tools": true,
-	}
-	// Optional-value: consume the next token only if it is not a leading-dash flag.
-	forwardOptionalValue = map[string]bool{
-		"-d": true, "--debug": true, "--from-pr": true, "--remote-control": true,
-		"-r": true, "--resume": true, "-w": true, "--worktree": true,
-	}
-)
+// prompt is separated from flag values correctly. Unknown leading-dash tokens are
+// treated as boolean (forward the flag alone) — that is safe for boolean flags,
+// but a value-taking flag missing from these tables would leak its value into the
+// positional prompt (the --thinking bug) or, if misclassified as variadic, would
+// swallow the prompt (the --plugin-dir bug). So the tables are not hand-curated:
+// forwardSingleValue / forwardVariadic / forwardOptionalValue and
+// PinnedClaudeVersion live in flags_gen.go, generated to mirror one specific
+// claude version's own argument parser. Regenerate against a matching claude when
+// bumping the pin.
+//
+//go:generate go run ./cmd/genclaudeflags -out flags_gen.go
 
 func isFlag(s string) bool { return len(s) > 1 && s[0] == '-' }
 
