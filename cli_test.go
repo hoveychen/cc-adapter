@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -221,5 +222,31 @@ func TestDedupBaselineFlags(t *testing.T) {
 	want := []string{"--model", "claude-opus-4-8", "--add-dir", "/tmp", "/var"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dedupBaselineFlags = %v, want %v", got, want)
+	}
+}
+
+// TestParseArgs_ThinkingAndMaxTurnsForwarded guards the value-taking flags the
+// claw-workspace sidecar passes for main-task dispatch: `--thinking <mode>
+// --thinking-display <display>` (thinking-token counter) and `--max-turns <n>`.
+// If any is absent from forwardSingleValue, parseArgs treats it as a boolean and
+// its value token is misclassified as the positional prompt, so the child claude
+// receives e.g. `--thinking --thinking-display` and rejects it
+// ("option '--thinking <mode>' argument '--thinking-display' is invalid").
+func TestParseArgs_ThinkingAndMaxTurnsForwarded(t *testing.T) {
+	o := parseArgs([]string{
+		"--output-format", "stream-json", "--input-format", "stream-json",
+		"--dangerously-skip-permissions",
+		"--thinking", "adaptive", "--thinking-display", "omitted",
+		"--max-turns", "50",
+	})
+	// No positional prompt: the sidecar feeds the prompt over stream-json stdin.
+	if p := o.prompt(); p != "" {
+		t.Fatalf("prompt should be empty, got %q (a flag value leaked into the positional)", p)
+	}
+	joined := strings.Join(o.forward, " ")
+	for _, want := range []string{"--thinking adaptive", "--thinking-display omitted", "--max-turns 50"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("forward must keep %q intact; got %v", want, o.forward)
+		}
 	}
 }

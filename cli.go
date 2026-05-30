@@ -88,10 +88,16 @@ var (
 		"--agent": true, "--agents": true, "--append-system-prompt": true,
 		"--system-prompt": true, "--debug-file": true, "--effort": true,
 		"--fallback-model": true, "--json-schema": true, "--max-budget-usd": true,
-		"--model": true, "--name": true, "-n": true, "--permission-mode": true,
+		"--max-turns": true,
+		"--model":     true, "--name": true, "-n": true, "--permission-mode": true,
 		"--permission-prompt-tool": true,
 		"--remote-control-session-name-prefix": true, "--session-id": true,
 		"--setting-sources": true, "--settings": true,
+		// --thinking <mode> / --thinking-display <display> are the thinking-token
+		// counter flags the claw-workspace sidecar passes for main-task dispatch.
+		// Both take a value; without them here the value token leaks into the
+		// positional prompt and the child sees a bare `--thinking --thinking-display`.
+		"--thinking": true, "--thinking-display": true,
 	}
 	// Variadic: consume following tokens until the next leading-dash token.
 	forwardVariadic = map[string]bool{
