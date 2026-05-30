@@ -265,3 +265,29 @@ func TestParseArgs_PluginDirSingleValue(t *testing.T) {
 		t.Fatalf("forward = %v, want %v", o.forward, wantFwd)
 	}
 }
+
+// TestParseArgs_HiddenValueFlagsForwarded covers value-taking flags that claude
+// hides from `--help` but still accepts at the top level. The generated table is
+// built from claude's own parser so these are classified as single-value; if the
+// table regressed to omitting them, each would be treated as boolean and its value
+// token would leak into the positional prompt.
+func TestParseArgs_HiddenValueFlagsForwarded(t *testing.T) {
+	o := parseArgs([]string{
+		"-p",
+		"--max-thinking-tokens", "8000",
+		"--system-prompt-file", "/tmp/sys.txt",
+		"--append-system-prompt-file", "/tmp/extra.txt",
+		"do the work",
+	})
+	if got := o.prompt(); got != "do the work" {
+		t.Fatalf("prompt = %q, want %q (a hidden flag's value leaked into the positional)", got, "do the work")
+	}
+	wantFwd := []string{
+		"--max-thinking-tokens", "8000",
+		"--system-prompt-file", "/tmp/sys.txt",
+		"--append-system-prompt-file", "/tmp/extra.txt",
+	}
+	if !reflect.DeepEqual(o.forward, wantFwd) {
+		t.Fatalf("forward = %v, want %v", o.forward, wantFwd)
+	}
+}
