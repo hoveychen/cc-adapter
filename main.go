@@ -39,7 +39,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -116,7 +115,6 @@ func run() int {
 		logger.Printf("%v", err)
 		return 1
 	}
-	warnIfClaudeVersionMismatch(claudePath, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -455,37 +453,6 @@ func runVersion(versionFlag string) int {
 		return 1
 	}
 	return 0
-}
-
-// reClaudeVersion pulls the leading X.Y.Z out of `claude --version` output
-// (e.g. "2.1.141 (Claude Code)").
-var reClaudeVersion = regexp.MustCompile(`\d+\.\d+\.\d+`)
-
-// warnIfClaudeVersionMismatch logs a non-fatal warning when the resolved claude
-// binary's version differs from the one flags_gen.go was generated against. The
-// flag-arity table mirrors PinnedClaudeVersion exactly, so a mismatched claude may
-// have added or removed flags the parser would then misclassify. It never blocks
-// startup: a stale table is usually still correct for the flags actually in use,
-// and the right fix is `go generate` against the new binary, not a hard failure.
-func warnIfClaudeVersionMismatch(claudePath string, logger *log.Logger) {
-	cmd := exec.Command(claudePath, "--version")
-	out, err := cmd.Output()
-	if err != nil {
-		return // version probe is best-effort; don't disrupt startup
-	}
-	if got, mismatched := claudeVersionMismatch(string(out)); mismatched {
-		logger.Printf("warning: claude %s does not match the flag table pinned to %s; "+
-			"if flag parsing misbehaves, regenerate with `go generate ./...` against this claude",
-			got, PinnedClaudeVersion)
-	}
-}
-
-// claudeVersionMismatch extracts the X.Y.Z from `claude --version` output and
-// reports whether it differs from PinnedClaudeVersion. An unparsable version
-// (got == "") is treated as no mismatch — we only warn on a confirmed difference.
-func claudeVersionMismatch(versionOutput string) (got string, mismatched bool) {
-	got = reClaudeVersion.FindString(versionOutput)
-	return got, got != "" && got != PinnedClaudeVersion
 }
 
 // resolveAccountUUID derives the account UUID from the shared OAuth credentials,
