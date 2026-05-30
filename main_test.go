@@ -13,7 +13,7 @@ func TestClaudeVersionMismatch(t *testing.T) {
 		wantMismat bool
 	}{
 		{"matches pinned", PinnedClaudeVersion + " (Claude Code)", PinnedClaudeVersion, false},
-		{"newer version", "2.1.156 (Claude Code)", "2.1.156", true},
+		{"newer version", "2.1.999 (Claude Code)", "2.1.999", true},
 		{"older version", "2.1.112 (Claude Code)", "2.1.112", true},
 		{"unparsable", "Claude Code", "", false},
 	}
