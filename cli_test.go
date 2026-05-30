@@ -250,3 +250,18 @@ func TestParseArgs_ThinkingAndMaxTurnsForwarded(t *testing.T) {
 		}
 	}
 }
+
+// TestParseArgs_PluginDirSingleValue guards against the inverse arity bug: claude
+// defines --plugin-dir <path> / --plugin-url <url> as single-value (repeatable),
+// NOT variadic. If they are misclassified as variadic, the flag over-consumes and
+// swallows the trailing positional prompt, leaving the child with no prompt.
+func TestParseArgs_PluginDirSingleValue(t *testing.T) {
+	o := parseArgs([]string{"-p", "--plugin-dir", "/some/dir", "the prompt"})
+	if got := o.prompt(); got != "the prompt" {
+		t.Fatalf("prompt = %q, want %q (--plugin-dir must consume only its single value, not swallow the positional)", got, "the prompt")
+	}
+	wantFwd := []string{"--plugin-dir", "/some/dir"}
+	if !reflect.DeepEqual(o.forward, wantFwd) {
+		t.Fatalf("forward = %v, want %v", o.forward, wantFwd)
+	}
+}
