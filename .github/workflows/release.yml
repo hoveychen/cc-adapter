@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -31,6 +31,20 @@ jobs:
           mkdir -p dist
           go build -trimpath -ldflags "-s -w" -o dist/cc-adapter .
           tar -C dist -czf "cc-adapter_${GITHUB_REF_NAME}_linux_${GOARCH}.tar.gz" cc-adapter
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goarch }}
+          path: "cc-adapter_*_linux_*.tar.gz"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
