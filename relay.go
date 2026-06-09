@@ -118,26 +118,51 @@ func (r *relay) signalFirstResult() { r.frOnce.Do(func() { close(r.firstResult) 
 // signals end-of-input and waits for claude to exit, returning its exit code.
 // The upstream→downstream direction is driven by the Host read goroutine calling
 // onUpstreamLine (wired as RawSink), so it runs concurrently with this pump.
-func (r *relay) run(_ context.Context, stdin io.Reader) int {
-	// Safety net: if the upstream read loop ends (claude exits) before a result
-	// frame, unblock the stdin-close gate so run() can't hang. The Host closes
-	// Events when claude's stdout reaches EOF; in relay mode nothing is pushed
-	// onto Events, so this drain just waits for that close.
+func (r *relay) run(ctx context.Context, stdin io.Reader) int {
+	// claudeDead closes when the Host closes Events, i.e. when claude's stdout
+	// reaches EOF — claude has exited for whatever reason. (In relay mode nothing
+	// is pushed onto Events, so this drain just waits for that close.) Closing it
+	// also unblocks the firstResult gate as a safety net.
+	claudeDead := make(chan struct{})
 	go func() {
 		for range r.host.Events {
 		}
+		close(claudeDead)
 		r.signalFirstResult()
 	}()
 
-	if err := r.pumpDownstream(stdin); err != nil {
-		r.logger.Printf("relay: downstream read: %v", err)
+	// Pump the SDK's stdin upstream on its own goroutine so claude's death or an
+	// OS signal can drive run() to return WITHOUT waiting for this blocking read.
+	// A blocking Read on os.Stdin is not interrupted by ctx cancellation, so if we
+	// awaited pumpDownstream inline, cc-adapter would hang whenever the SDK keeps
+	// its stdin open past claude's exit (the lifecycle-follow bug) or past a signal
+	// (the no-prompt-exit bug). The leaked goroutine is harmless: run()'s caller
+	// os.Exits right after.
+	pumpDone := make(chan struct{})
+	go func() {
+		if err := r.pumpDownstream(stdin); err != nil {
+			r.logger.Printf("relay: downstream read: %v", err)
+		}
+		close(pumpDone)
+	}()
+
+	select {
+	case <-pumpDone:
+		// The SDK closed its downstream stdin (normal end-of-input). Do NOT close
+		// claude's stdin yet: because we always inject in-process MCP servers, the
+		// control protocol needs it open until the turn produces a result (so
+		// claude's mcp_message init and any can_use_tool round-trips can be
+		// answered, and claude_launched lands). firstResult is also released if
+		// claude dies first, so this never hangs.
+		<-r.firstResult
+		_ = r.host.CloseInput()
+	case <-claudeDead:
+		// claude exited on its own (or was killed externally). Follow it down
+		// immediately — do not wait on a downstream stdin the SDK may keep open.
+	case <-ctx.Done():
+		// cc-adapter received an OS signal. The Host's cmd.Cancel forwards it to
+		// claude; just tear down and let Wait collect the child's exit code.
 	}
-	// The SDK has closed its downstream stdin. Do NOT close claude's stdin yet:
-	// because we always inject in-process MCP servers, the control protocol needs
-	// it open until the turn produces a result (so claude's mcp_message init and
-	// any can_use_tool round-trips can be answered, and claude_launched lands).
-	<-r.firstResult
-	_ = r.host.CloseInput()
 	return r.host.Wait()
 }
 
