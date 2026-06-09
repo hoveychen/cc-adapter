@@ -24,7 +24,19 @@ import (
 // exercised end to end against a deterministic child.
 func TestMain(m *testing.M) {
 	if os.Getenv("CCA_FAKE_CLAUDE") == "1" {
-		os.Exit(fakeClaudeMain())
+		// CCA_FAKE_MODE selects an alternate fake-claude behaviour for the
+		// signal/lifecycle tests (see signal_lifecycle_test.go). Empty = the
+		// original one-shot MCP-handshake fake used by the handshake test.
+		switch os.Getenv("CCA_FAKE_MODE") {
+		case "block":
+			os.Exit(fakeClaudeBlock())
+		case "die":
+			os.Exit(fakeClaudeDie())
+		case "signal":
+			os.Exit(fakeClaudeSignal())
+		default:
+			os.Exit(fakeClaudeMain())
+		}
 	}
 	os.Exit(m.Run())
 }

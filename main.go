@@ -41,6 +41,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -116,8 +117,31 @@ func run() int {
 		return 1
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Capture SIGINT/SIGTERM ourselves (rather than signal.NotifyContext) so we
+	// can both cancel ctx AND remember which signal arrived. The Host forwards
+	// that same signal to claude on cancellation, so the child runs its own
+	// disposition (SIGINT -> graceful exit 0, SIGTERM -> 143) instead of being
+	// force-SIGKILLed — matching how a directly-signalled claude behaves.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var caughtSig atomic.Value // os.Signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if s, ok := <-sigCh; ok {
+			caughtSig.Store(s)
+			cancel()
+		}
+	}()
+	// forwardSignal is what the Host delivers to claude when ctx is cancelled.
+	// If ctx was cancelled for a non-signal reason, default to a graceful SIGTERM
+	// rather than SIGKILL.
+	forwardSignal := func() os.Signal {
+		if v := caughtSig.Load(); v != nil {
+			return v.(os.Signal)
+		}
+		return syscall.SIGTERM
+	}
 
 	cwd, _ := os.Getwd()
 	var workspaceFolders []string
@@ -160,7 +184,7 @@ func run() int {
 	// stdin/stdout and bridges both control channels; the print/REPL paths below
 	// are bypassed entirely.
 	if opts.relayMode() {
-		return runRelay(ctx, claudePath, mcpServer, extra, opts, logger, emitTelemetry)
+		return runRelay(ctx, claudePath, mcpServer, extra, opts, logger, emitTelemetry, forwardSignal)
 	}
 
 	perm := func(tool string, _ json.RawMessage) (bool, string) {
@@ -183,6 +207,7 @@ func run() int {
 		ExtraArgs:     extra,
 		Permission:    perm,
 		Logger:        logger,
+		ForwardSignal: forwardSignal,
 	}
 	if !interactive {
 		ps = newPrintState(opts.outputFormat)
