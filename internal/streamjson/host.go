@@ -54,6 +54,7 @@ type Host struct {
 	permission     PermissionFunc
 	rawSink        func([]byte) // optional: receives every raw stdout line (incl. trailing newline)
 	relayMode      bool         // when true, readLoop hands raw lines to rawSink only (no decode/auto-handle)
+	forwardSignal  func() os.Signal
 	logger         *log.Logger
 
 	cmd     *exec.Cmd
@@ -92,6 +93,15 @@ type Config struct {
 	// in-process IDE/comm MCP servers, and injecting the claude_launched log_event.
 	// The Host still owns spawn + the vscode env/baseline, which is the point.
 	RelayMode bool
+
+	// ForwardSignal, if set, returns the signal the Host delivers to the child
+	// when its context is cancelled, instead of an unconditional SIGKILL. This
+	// lets cc-adapter relay the same OS signal it received (SIGINT/SIGTERM) to
+	// claude so the child's own signal disposition — and thus the exit code —
+	// matches a directly-signalled claude. The Host also arms a WaitDelay so a
+	// child that ignores the forwarded signal is still SIGKILLed eventually. A
+	// nil return falls back to SIGKILL.
+	ForwardSignal func() os.Signal
 }
 
 // NewHost prepares (but does not start) a Host.
@@ -120,6 +130,7 @@ func NewHost(cfg Config) *Host {
 		permission:     perm,
 		rawSink:        cfg.RawSink,
 		relayMode:      cfg.RelayMode,
+		forwardSignal:  cfg.ForwardSignal,
 		logger:         logger,
 		pending:        make(map[string]chan ControlResponseBody),
 		Events:         make(chan Event, 64),
