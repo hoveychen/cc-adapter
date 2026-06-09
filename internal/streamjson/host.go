@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/hoveychen/cc-adapter/internal/ide"
@@ -203,6 +204,22 @@ func (h *Host) Start(ctx context.Context) error {
 	h.cmd.Env = h.buildEnv()
 	h.cmd.Stderr = os.Stderr
 
+	// When ForwardSignal is set, deliver that signal (the OS signal cc-adapter
+	// itself received) to claude on ctx cancellation instead of the default
+	// SIGKILL, so claude's own signal handling runs and its exit code matches a
+	// directly-signalled claude. WaitDelay guarantees a child that ignores the
+	// forwarded signal is still SIGKILLed rather than wedging cc-adapter open.
+	if h.forwardSignal != nil {
+		h.cmd.Cancel = func() error {
+			sig := h.forwardSignal()
+			if sig == nil {
+				return h.cmd.Process.Kill()
+			}
+			return h.cmd.Process.Signal(sig)
+		}
+		h.cmd.WaitDelay = 5 * time.Second
+	}
+
 	stdin, err := h.cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -384,14 +401,24 @@ func (h *Host) CloseInput() error {
 	return h.stdin.Close()
 }
 
-// Wait blocks until the child exits and returns its exit code.
+// Wait blocks until the child exits and returns its exit code. A child killed
+// by a signal is mapped to 128+signum (the shell convention), matching how a
+// directly-signalled claude reports — e.g. SIGTERM -> 143. It reads the result
+// from cmd.ProcessState rather than the Wait error because, once a forwarded
+// signal / ctx cancellation is in play, exec wraps the error in the context's
+// error (not an *ExitError) even when the child exited cleanly with 0 — so the
+// error alone can't be trusted for the code. ProcessState is always populated
+// after Wait returns and carries the true wait status.
 func (h *Host) Wait() int {
 	err := h.cmd.Wait()
+	if ps := h.cmd.ProcessState; ps != nil {
+		if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal())
+		}
+		return ps.ExitCode()
+	}
 	if err == nil {
 		return 0
-	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		return ee.ExitCode()
 	}
 	return 1
 }
