@@ -20,7 +20,7 @@ import (
 // differs is that the Host does no decoding and the relay owns all routing. The
 // RawSink closure captures r, which is assigned before Start launches the read
 // goroutine that invokes it.
-func runRelay(ctx context.Context, claudePath string, mcpServer *ide.MCPServer, extra []string, opts cliOpts, logger *log.Logger, emitTelemetry func(string, map[string]any)) int {
+func runRelay(ctx context.Context, claudePath string, mcpServer *ide.MCPServer, extra []string, opts cliOpts, logger *log.Logger, emitTelemetry func(string, map[string]any), forwardSignal func() os.Signal) int {
 	var r *relay
 	host := streamjson.NewHost(streamjson.Config{
 		ClaudePath:    claudePath,
@@ -29,6 +29,7 @@ func runRelay(ctx context.Context, claudePath string, mcpServer *ide.MCPServer, 
 		ExtraArgs:     extra,
 		Logger:        logger,
 		RelayMode:     true,
+		ForwardSignal: forwardSignal,
 		RawSink:       func(line []byte) { r.onUpstreamLine(line) },
 	})
 	r = newRelay(host, opts.denyWrites, logger)
